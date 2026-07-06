@@ -1,0 +1,9 @@
+# GUI client (gui.py)
+PySide6>=6.6
+pyqtgraph>=0.13
+# Used by the GUI's "WiFi setup…" dialog to push credentials over the ESP32-C3's
+# USB serial port (serial_provision.py). The GUI still launches without it - the
+# USB path just disables itself and tells you to install it.
+pyserial>=3.5
+
+# The CLI client (nemisis_debug.py) needs none of the above - it's stdlib only.

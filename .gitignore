@@ -1,0 +1,37 @@
+# ─── Build outputs ───────────────────────────────────────────────
+# PlatformIO build/upload/cache dirs (STM32 firmware + ESP32-C3 bridge)
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# STM32CubeMX / GCC intermediates
+*.o
+*.d
+*.su
+*.elf
+*.map
+*.hex.tmp
+
+# ─── Python (debug app) ──────────────────────────────────────────
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ─── Runtime captures / diagnostics (regenerable data, not source) ─
+logs/
+*.jsonl
+*.csv.tmp
+
+# ─── Editor / IDE / tool state ───────────────────────────────────
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch/
+.claude/
+.DS_Store
+Thumbs.db
