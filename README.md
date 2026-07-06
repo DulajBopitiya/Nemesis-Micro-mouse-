@@ -1,8 +1,12 @@
 <div align="center">
 
+<img src="assets/fabvolt-banner.png" alt="FabVolt Technologies" width="720">
+
 # 🐭 NEMESIS — Micromouse
 
 ### A custom STM32G474 half-size maze-solving robot, its WiFi debug bridge, and a live tuning cockpit.
+
+<sup>A **FabVolt Technologies** project</sup>
 
 [![MCU](https://img.shields.io/badge/MCU-STM32G474RET6-03234b?logo=stmicroelectronics&logoColor=white)](https://www.st.com/en/microcontrollers-microprocessors/stm32g474re.html)
 [![Bridge](https://img.shields.io/badge/Link-ESP32--C3%20WiFi-e7352c?logo=espressif&logoColor=white)](https://www.espressif.com/en/products/socs/esp32-c3)
@@ -120,5 +124,9 @@ python gui.py            # connects to the bridge at 192.168.4.1:3333
 ---
 
 <div align="center">
-<sub>Built with too much coffee and a soldering iron. 🔧</sub>
+
+<img src="assets/fabvolt-banner.png" alt="FabVolt Technologies" width="360">
+
+**© FabVolt Technologies** · Built with too much coffee and a soldering iron. 🔧
+
 </div>
