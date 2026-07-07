@@ -32,6 +32,7 @@
 #define QSPI_META_INCOMING  0x0F0000u
 #define QSPI_SLOT_GOLDEN    0x100000u
 #define QSPI_META_GOLDEN    0x1F0000u
+#define QSPI_META_CURRENT   0x0E0000u        /* CRC/size of what the app slot holds */
 #define OTA_META_MAGIC      0x4F544131u
 #define OTA_STATUS_VALID    0xA5A5A5A5u
 #define OTA_APPLY_MAGIC     0x0A7A0A7Au
@@ -137,6 +138,70 @@ static bool qspi_read(uint32_t addr, uint8_t *buf, uint32_t len)
   return HAL_QSPI_Receive(&hqspi1, buf, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) == HAL_OK;
 }
 
+/* ---- QSPI write path (for the current-app metadata sector) ---------------- */
+static bool qspi_cmd_only(uint8_t instr)
+{
+  QSPI_CommandTypeDef c = {0};
+  c.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+  c.Instruction     = instr;
+  c.AddressMode     = QSPI_ADDRESS_NONE;
+  c.DataMode        = QSPI_DATA_NONE;
+  return HAL_QSPI_Command(&hqspi1, &c, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) == HAL_OK;
+}
+
+static bool qspi_wait_wip(uint32_t tmo_ms)
+{
+  uint32_t start = HAL_GetTick();
+  for (;;)
+  {
+    QSPI_CommandTypeDef c = {0};
+    c.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+    c.Instruction     = 0x05;                     /* READ STATUS REG 1 */
+    c.AddressMode     = QSPI_ADDRESS_NONE;
+    c.DataMode        = QSPI_DATA_1_LINE;
+    c.NbData          = 1;
+    uint8_t sr1 = 0xFF;
+    if (HAL_QSPI_Command(&hqspi1, &c, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) return false;
+    if (HAL_QSPI_Receive(&hqspi1, &sr1, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) return false;
+    if ((sr1 & 0x01u) == 0) return true;          /* WIP clear */
+    if ((HAL_GetTick() - start) > tmo_ms) return false;
+  }
+}
+
+static bool qspi_addr_cmd(uint8_t instr, uint32_t addr)
+{
+  QSPI_CommandTypeDef c = {0};
+  c.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+  c.Instruction     = instr;
+  c.AddressMode     = QSPI_ADDRESS_1_LINE;
+  c.AddressSize     = QSPI_ADDRESS_24_BITS;
+  c.Address         = addr;
+  c.DataMode        = QSPI_DATA_NONE;
+  return HAL_QSPI_Command(&hqspi1, &c, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) == HAL_OK;
+}
+
+/* Erase the 4 KB sector at `addr`, then program `len` (<= 256) bytes. Used only
+   for the small metadata records, so a single page program is enough. */
+static bool qspi_write_meta(uint32_t addr, const void *data, uint32_t len)
+{
+  if (!qspi_cmd_only(0x06)) return false;                    /* WRITE ENABLE */
+  if (!qspi_addr_cmd(0x20, addr)) return false;             /* SECTOR ERASE */
+  if (!qspi_wait_wip(6000u)) return false;
+
+  if (!qspi_cmd_only(0x06)) return false;                    /* WRITE ENABLE */
+  QSPI_CommandTypeDef c = {0};
+  c.InstructionMode = QSPI_INSTRUCTION_1_LINE;
+  c.Instruction     = 0x02;                                  /* PAGE PROGRAM */
+  c.AddressMode     = QSPI_ADDRESS_1_LINE;
+  c.AddressSize     = QSPI_ADDRESS_24_BITS;
+  c.Address         = addr;
+  c.DataMode        = QSPI_DATA_1_LINE;
+  c.NbData          = len;
+  if (HAL_QSPI_Command(&hqspi1, &c, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) return false;
+  if (HAL_QSPI_Transmit(&hqspi1, (uint8_t *)data, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) return false;
+  return qspi_wait_wip(6000u);
+}
+
 /* CRC-32 the QSPI image by streaming it out in blocks. */
 static bool qspi_crc(uint32_t base, uint32_t size, uint32_t *out)
 {
@@ -207,24 +272,28 @@ static bool flash_program_app(uint32_t qspi_src, uint32_t size)
   return ok;
 }
 
-/* Install the CRC-valid image from a QSPI slot (incoming or golden) into the app
-   slot, verifying source and result. Returns true on a fully verified install.
-   Assumes qspi_init() already succeeded. */
-static bool install_from(uint32_t qspi_slot, uint32_t qspi_meta)
+/* Read a QSPI metadata record and sanity-check it. */
+static bool read_valid_meta(uint32_t meta_addr, OtaMeta *m)
 {
-  OtaMeta m;
-  if (!qspi_read(qspi_meta, (uint8_t *)&m, sizeof m)) return false;
-  if (m.magic != OTA_META_MAGIC || m.status != OTA_STATUS_VALID) return false;
-  if (m.size == 0u || m.size > OTA_IMAGE_MAX) return false;
+  if (!qspi_read(meta_addr, (uint8_t *)m, sizeof *m)) return false;
+  if (m->magic != OTA_META_MAGIC || m->status != OTA_STATUS_VALID) return false;
+  if (m->size == 0u || m->size > OTA_IMAGE_MAX) return false;
+  return true;
+}
 
-  /* Re-verify the source image in QSPI before touching internal flash. */
+/* Install the image described by `m` from `qspi_slot` into the app slot,
+   verifying the QSPI source first and the programmed result after. On success,
+   record it as the current app image so the boot-time gate can validate later.
+   Assumes qspi_init() already ran. */
+static bool install_meta(uint32_t qspi_slot, const OtaMeta *m)
+{
   uint32_t src_crc = 0;
-  if (!qspi_crc(qspi_slot, m.size, &src_crc) || src_crc != m.crc32) return false;
+  if (!qspi_crc(qspi_slot, m->size, &src_crc) || src_crc != m->crc32) return false;
+  if (!flash_program_app(qspi_slot, m->size)) return false;
+  if (crc32(0, (const uint8_t *)APP_BASE, m->size) != m->crc32) return false;
 
-  if (!flash_program_app(qspi_slot, m.size)) return false;
-
-  /* Verify what actually landed in the app slot (memory-mapped read). */
-  return crc32(0, (const uint8_t *)APP_BASE, m.size) == m.crc32;
+  qspi_write_meta(QSPI_META_CURRENT, m, sizeof *m);   /* what the app slot now holds */
+  return true;
 }
 
 /* Apply a staged update. On success flags the green boot-confirm. If the copy
@@ -232,20 +301,40 @@ static bool install_from(uint32_t qspi_slot, uint32_t qspi_meta)
    board can't be stranded by a bad/interrupted apply. */
 static void do_apply(void)
 {
-  if (!qspi_init()) return;
-  if (install_from(QSPI_SLOT_INCOMING, QSPI_META_INCOMING))
-    TAMP->BKP1R = OTA_APPLIED_MAGIC;               /* app flashes green */
-  else
-    (void)install_from(QSPI_SLOT_GOLDEN, QSPI_META_GOLDEN);  /* best-effort rescue */
-  HAL_QSPI_DeInit(&hqspi1);
+  OtaMeta m;
+  if (read_valid_meta(QSPI_META_INCOMING, &m) && install_meta(QSPI_SLOT_INCOMING, &m))
+  {
+    TAMP->BKP1R = OTA_APPLIED_MAGIC;                 /* app flashes green */
+    return;
+  }
+  OtaMeta g;                                          /* rescue: restore golden */
+  if (read_valid_meta(QSPI_META_GOLDEN, &g))
+    (void)install_meta(QSPI_SLOT_GOLDEN, &g);
 }
 
 /* Explicit rollback: restore the golden image into the app slot. */
 static void do_rollback(void)
 {
-  if (!qspi_init()) return;
-  (void)install_from(QSPI_SLOT_GOLDEN, QSPI_META_GOLDEN);
-  HAL_QSPI_DeInit(&hqspi1);
+  OtaMeta g;
+  if (read_valid_meta(QSPI_META_GOLDEN, &g))
+    (void)install_meta(QSPI_SLOT_GOLDEN, &g);
+}
+
+/* Boot-time safety gate (runs EVERY boot): if we know what the app slot should
+   contain (current metadata) and the slot no longer matches it - a partial copy
+   from a power loss mid-apply, or corruption - restore the golden image. This is
+   what makes a power loss during an update non-bricking. No-op until an OTA has
+   established the current metadata (fresh SWD-flashed boards fall through to the
+   vector-sanity jump). */
+static void validate_and_recover(void)
+{
+  OtaMeta cur;
+  if (!read_valid_meta(QSPI_META_CURRENT, &cur)) return;      /* gate inactive */
+  if (crc32(0, (const uint8_t *)APP_BASE, cur.size) == cur.crc32) return; /* app ok */
+
+  OtaMeta g;                                          /* app slot is bad -> golden */
+  if (read_valid_meta(QSPI_META_GOLDEN, &g))
+    (void)install_meta(QSPI_SLOT_GOLDEN, &g);
 }
 
 /* ===========================================================================
@@ -281,11 +370,18 @@ int main(void)
 
   uint32_t flag = apply_flag_read();
   if (flag == OTA_APPLY_MAGIC || flag == OTA_ROLLBACK_MAGIC)
-  {
     apply_flag_clear();                 /* one-shot: clear BEFORE work so a failed
                                            op can't loop forever */
-    if (flag == OTA_APPLY_MAGIC) do_apply();
-    else                         do_rollback();
+
+  /* All QSPI work shares one init/deinit. Requested apply/rollback first, then
+     the universal boot-time gate that catches a bad app slot (e.g. power lost
+     mid-copy) and restores golden. */
+  if (qspi_init())
+  {
+    if (flag == OTA_APPLY_MAGIC)         do_apply();
+    else if (flag == OTA_ROLLBACK_MAGIC) do_rollback();
+    validate_and_recover();
+    HAL_QSPI_DeInit(&hqspi1);
   }
 
   jump_to_app(APP_BASE);

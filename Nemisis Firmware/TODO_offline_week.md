@@ -145,10 +145,19 @@ memory `ota-external-flash-plan.md`.
       golden / Roll back). Verified via J-Link: normal boot ✓, apply-from-incoming
       still ✓ (B2 regression), rollback with empty golden = safe no-op ✓ (never
       strands). Full golden→rollback round-trip = user bench test.
-- [ ] B3.2 (automatic): bootloader stores current-app CRC meta; on every boot
-      CRC-gates the app slot and auto-restores golden if bad (closes the
-      power-loss-during-copy window). Plus boot-confirm trial counter for a
-      complete-but-crashing image. SWD net throughout.
+- [x] **B3.2 — automatic boot-time CRC gate (2026-07-07, regression HW-verified):**
+      bootloader writes current-app meta (size+crc @ QSPI 0x0E0000) on every
+      successful install/rollback; on EVERY boot `validate_and_recover()` CRCs
+      the app slot vs current-meta and auto-restores golden on mismatch — closes
+      the power-loss-during-copy window (backup-reg apply flag is lost on power
+      loss, but current-meta is in non-volatile QSPI). Added QSPI write path to
+      the bootloader (5.2KB). `ota info` shows golden/current state. Verified via
+      J-Link: normal boot ✓, apply writes current-meta + gate passes good app ✓
+      (no false-positive/hang). Full auto-rescue = collaborative test
+      (`tools/corrupt_app.jlink` after golden populated).
+- [ ] B3.3 (optional): boot-confirm trial counter for a complete-but-CRC-valid
+      image that crashes at runtime (app confirms healthy; N unconfirmed boots →
+      restore golden). Different failure mode than B3.2's corruption gate.
 - [ ] (was) B2 bootloader (bottom of flash, never OTA'd): entry via RTC-backup
       flag + reset; receive image over PC4/PC5; CRC-verify in external flash; copy to
       internal app slot; jump. Keep a golden image in external flash for rollback

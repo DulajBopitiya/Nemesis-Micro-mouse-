@@ -30,6 +30,7 @@
 
 #define OTA_SLOT_INCOMING    0x000000u
 #define OTA_META_INCOMING    0x0F0000u
+#define OTA_META_CURRENT     0x0E0000u   /* CRC/size of what the app slot holds  */
 #define OTA_SLOT_GOLDEN      0x100000u
 #define OTA_META_GOLDEN      0x1F0000u
 

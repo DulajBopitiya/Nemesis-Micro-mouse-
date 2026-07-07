@@ -2390,6 +2390,7 @@ static void cmd_ota(int argc, char **argv)
 
   if (ci_eq(sub, "info"))
   {
+    cprintf("OTA golden image: %s\r\n", Ota_GoldenValid() ? "VALID (rollback ready)" : "none");
     OtaMeta m;
     if (!Ota_ReadMeta(&m)) { puts_("ota: meta read FAILED\r\n"); return; }
     cprintf("OTA incoming: magic=%08lX size=%lu crc=%08lX status=%s\r\n",
