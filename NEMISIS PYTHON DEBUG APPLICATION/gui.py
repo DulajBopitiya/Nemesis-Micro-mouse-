@@ -1838,16 +1838,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("[not connected]")
             return
 
-        # Default to the PlatformIO build output if it's where we expect it.
+        # Default to the OTA-relocated build (env:app_ota) - that's the image the
+        # bootloader copies to 0x08008000. The normal nucleo_g474re build is
+        # 0x08000000-based and would crash if installed into the app slot.
         default_dir = ""
         guess = (Path(__file__).resolve().parent.parent
-                 / "Nemisis Firmware" / ".pio" / "build" / "nucleo_g474re"
+                 / "Nemisis Firmware" / ".pio" / "build" / "app_ota"
                  / "firmware.bin")
         if guess.exists():
             default_dir = str(guess)
 
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select firmware image", default_dir,
+            self, "Select firmware image (app_ota build)", default_dir,
             "Firmware image (*.bin);;All files (*)")
         if not path:
             return

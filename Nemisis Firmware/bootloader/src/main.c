@@ -1,69 +1,274 @@
 /*
- * NEMESIS OTA bootloader - B1: jump-only stub.
+ * NEMESIS OTA bootloader - B2: install a staged image, then jump.
  *
- * Runs on reset from 0x08000000. For B1 it does nothing but validate the app's
- * vector table and jump to it, to prove the relocation (app based at 0x08008000
- * with VTOR moved) boots and runs correctly through a bootloader handoff.
+ * Runs on reset from 0x08000000. Flow:
+ *   1. If the "apply" flag (TAMP backup reg 0) is set, clear it (one-shot) and,
+ *      if the QSPI incoming image CRC-verifies, copy it into the internal app
+ *      slot (0x08008000) and verify the copy.
+ *   2. Jump to the app at 0x08008000 (validating its vector first).
  *
- * B2 will add, BEFORE the jump: read an "apply" flag from an RTC backup
- * register; if set and the QSPI incoming image is CRC-valid, copy it into the
- * app slot (HAL_FLASH), verify, clear the flag; then jump. SWD/J-Link stays the
- * ultimate recovery net - flashing a normal 0x08000000-based build overwrites
- * both this bootloader and the app slot and boots directly.
+ * It is NEVER OTA-updated. SWD/J-Link stays the ultimate recovery net: flashing
+ * a normal 0x08000000-based build overwrites both this and the app slot.
  *
- * Deliberately minimal: no clock/peripheral setup. SystemInit() (framework) has
- * already run; the app configures its own clocks, so we leave the MCU in reset
- * defaults and hand over cleanly.
+ * B2 is single-slot: a power loss DURING the copy can leave a partial app
+ * (recover via SWD). B3 will add a golden image + rollback to close that window.
+ *
+ * Runs at the reset-default HSI (~16 MHz) - no PLL/HSE setup. QSPI is sourced
+ * from SYSCLK, so ~4 MHz here; fine for a one-time image copy. The app sets up
+ * its own 160 MHz clock after the jump.
  */
-#include "stm32g4xx.h"
+#include "stm32g4xx_hal.h"
+#include <string.h>
+#include <stdbool.h>
 
-#define APP_BASE       0x08008000u
-#define RAM_START      0x20000000u
-#define RAM_END        0x20020000u          /* 128 KB */
+/* ---- flash map ---- */
+#define APP_BASE            0x08008000u
+#define RAM_START           0x20000000u
+#define RAM_END             0x20020000u          /* 128 KB */
 
-/* Jump to the application at `base`. Never returns on success. */
+/* ---- shared OTA constants (MUST match lib/ota/ota.h) ---- */
+#define OTA_IMAGE_MAX       (480u * 1024u)
+#define QSPI_SLOT_INCOMING  0x000000u
+#define QSPI_META_INCOMING  0x0F0000u
+#define OTA_META_MAGIC      0x4F544131u
+#define OTA_STATUS_VALID    0xA5A5A5A5u
+#define OTA_APPLY_MAGIC     0x0A7A0A7Au
+
+typedef struct { uint32_t magic, size, crc32, status; } OtaMeta;
+
+QSPI_HandleTypeDef hqspi1;
+
+/* HAL_Init() enables the SysTick interrupt for its blocking-timeout tick, so we
+   MUST provide the handler. Without it the first tick (~1 ms after HAL_Init)
+   vectors to the weak Default_Handler (an infinite loop) and the bootloader
+   freezes before doing anything. (The app has this in stm32g4xx_it.c, which the
+   bootloader project doesn't include.) */
+void SysTick_Handler(void) { HAL_IncTick(); }
+
+/* ===========================================================================
+ *  Apply flag (TAMP backup register 0)
+ * ========================================================================= */
+static void bkp_access_enable(void)
+{
+  __HAL_RCC_PWR_CLK_ENABLE();
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_RTCAPB_CLK_ENABLE();
+}
+static uint32_t apply_flag_read(void)  { return TAMP->BKP0R; }
+static void     apply_flag_clear(void) { TAMP->BKP0R = 0u; }
+
+/* ===========================================================================
+ *  CRC-32 (zlib/IEEE, poly 0xEDB88320) - matches lib/ota Ota_Crc32
+ * ========================================================================= */
+static uint32_t crc32(uint32_t crc, const uint8_t *d, uint32_t n)
+{
+  crc = ~crc;
+  for (uint32_t i = 0; i < n; i++)
+  {
+    crc ^= d[i];
+    for (int k = 0; k < 8; k++)
+      crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+  }
+  return ~crc;
+}
+
+/* ===========================================================================
+ *  QSPI (single-line indirect read; mirrors lib/qspiflash)
+ * ========================================================================= */
+void HAL_QSPI_MspInit(QSPI_HandleTypeDef *hqspi)
+{
+  if (hqspi->Instance != QUADSPI) return;
+
+  RCC_PeriphCLKInitTypeDef pclk = {0};
+  pclk.PeriphClockSelection = RCC_PERIPHCLK_QSPI;
+  pclk.QspiClockSelection   = RCC_QSPICLKSOURCE_SYSCLK;
+  HAL_RCCEx_PeriphCLKConfig(&pclk);
+
+  __HAL_RCC_QSPI_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  GPIO_InitTypeDef g = {0};
+  g.Mode      = GPIO_MODE_AF_PP;
+  g.Pull      = GPIO_NOPULL;
+  g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+  g.Alternate = GPIO_AF10_QUADSPI;
+  g.Pin = GPIO_PIN_6 | GPIO_PIN_7;                         /* PA6/PA7 IO3/IO2 */
+  HAL_GPIO_Init(GPIOA, &g);
+  g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_10 | GPIO_PIN_11; /* PB0/1/10/11 */
+  HAL_GPIO_Init(GPIOB, &g);
+}
+
+static bool qspi_init(void)
+{
+  hqspi1.Instance = QUADSPI;
+  hqspi1.Init.ClockPrescaler     = 3;
+  hqspi1.Init.FifoThreshold      = 4;
+  hqspi1.Init.SampleShifting     = QSPI_SAMPLE_SHIFTING_NONE;
+  hqspi1.Init.FlashSize          = 21;                  /* 4 MB */
+  hqspi1.Init.ChipSelectHighTime = QSPI_CS_HIGH_TIME_6_CYCLE;
+  hqspi1.Init.ClockMode          = QSPI_CLOCK_MODE_0;
+  hqspi1.Init.FlashID            = QSPI_FLASH_ID_1;
+  hqspi1.Init.DualFlash          = QSPI_DUALFLASH_DISABLE;
+  return HAL_QSPI_Init(&hqspi1) == HAL_OK;
+}
+
+static bool qspi_read(uint32_t addr, uint8_t *buf, uint32_t len)
+{
+  QSPI_CommandTypeDef c = {0};
+  c.InstructionMode   = QSPI_INSTRUCTION_1_LINE;
+  c.Instruction       = 0x03;                            /* READ DATA */
+  c.AddressMode       = QSPI_ADDRESS_1_LINE;
+  c.AddressSize       = QSPI_ADDRESS_24_BITS;
+  c.Address           = addr;
+  c.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
+  c.DataMode          = QSPI_DATA_1_LINE;
+  c.DummyCycles       = 0;
+  c.NbData            = len;
+  c.DdrMode           = QSPI_DDR_MODE_DISABLE;
+  c.DdrHoldHalfCycle  = QSPI_DDR_HHC_ANALOG_DELAY;
+  c.SIOOMode          = QSPI_SIOO_INST_EVERY_CMD;
+  if (HAL_QSPI_Command(&hqspi1, &c, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK)
+    return false;
+  return HAL_QSPI_Receive(&hqspi1, buf, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) == HAL_OK;
+}
+
+/* CRC-32 the QSPI image by streaming it out in blocks. */
+static bool qspi_crc(uint32_t base, uint32_t size, uint32_t *out)
+{
+  uint8_t buf[256];
+  uint32_t crc = 0, off = 0;
+  while (off < size)
+  {
+    uint32_t n = size - off;
+    if (n > sizeof buf) n = sizeof buf;
+    if (!qspi_read(base + off, buf, n)) return false;
+    crc = crc32(crc, buf, n);
+    off += n;
+  }
+  *out = crc;
+  return true;
+}
+
+/* ===========================================================================
+ *  Copy QSPI incoming image -> internal app slot, then verify
+ * ========================================================================= */
+static bool flash_program_app(uint32_t size)
+{
+  /* DBANK-aware page geometry (same scheme as lib/mazestore). The app slot at
+     0x08008000 is well within bank 1 in both single- and dual-bank modes. */
+  uint32_t page_sz    = (FLASH->OPTR & FLASH_OPTR_DBANK) ? 0x800u : 0x1000u;
+  uint32_t first_page = (APP_BASE - FLASH_BASE) / page_sz;
+  uint32_t npages     = (size + page_sz - 1u) / page_sz;
+
+  HAL_FLASH_Unlock();
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+
+  FLASH_EraseInitTypeDef er = {0};
+  er.TypeErase = FLASH_TYPEERASE_PAGES;
+  er.Banks     = FLASH_BANK_1;
+  er.Page      = first_page;
+  er.NbPages   = npages;
+  uint32_t page_err = 0;
+  if (HAL_FLASHEx_Erase(&er, &page_err) != HAL_OK)
+  {
+    HAL_FLASH_Lock();
+    return false;
+  }
+
+  uint8_t buf[256];
+  uint32_t off = 0;
+  bool ok = true;
+  while (off < size && ok)
+  {
+    uint32_t n = size - off;
+    if (n > sizeof buf) n = sizeof buf;
+    if (!qspi_read(QSPI_SLOT_INCOMING + off, buf, n)) { ok = false; break; }
+
+    for (uint32_t i = 0; i < n; i += 8u)
+    {
+      uint64_t dw = 0xFFFFFFFFFFFFFFFFull;      /* pad the tail with erased 0xFF */
+      uint32_t chunk = (n - i >= 8u) ? 8u : (n - i);
+      memcpy(&dw, buf + i, chunk);
+      if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                            APP_BASE + off + i, dw) != HAL_OK)
+      {
+        ok = false;
+        break;
+      }
+    }
+    off += n;
+  }
+  HAL_FLASH_Lock();
+  return ok;
+}
+
+/* If the apply flag is set and a CRC-valid image is staged in QSPI, install it.
+   Any failure just falls through to jumping the existing app. */
+static void maybe_apply_update(void)
+{
+  if (!qspi_init()) return;
+
+  OtaMeta m;
+  if (!qspi_read(QSPI_META_INCOMING, (uint8_t *)&m, sizeof m)) goto done;
+  if (m.magic != OTA_META_MAGIC || m.status != OTA_STATUS_VALID) goto done;
+  if (m.size == 0u || m.size > OTA_IMAGE_MAX) goto done;
+
+  /* Re-verify the source image in QSPI before touching internal flash. */
+  uint32_t src_crc = 0;
+  if (!qspi_crc(QSPI_SLOT_INCOMING, m.size, &src_crc) || src_crc != m.crc32)
+    goto done;
+
+  if (!flash_program_app(m.size)) goto done;
+
+  /* Verify what actually landed in the app slot (memory-mapped read). If this
+     fails the slot is bad, but we've done all we can here - B3 adds rollback. */
+  if (crc32(0, (const uint8_t *)APP_BASE, m.size) != m.crc32) goto done;
+
+done:
+  HAL_QSPI_DeInit(&hqspi1);
+}
+
+/* ===========================================================================
+ *  Jump to the application (validates vector; restores IRQ state)
+ * ========================================================================= */
 static void jump_to_app(uint32_t base)
 {
-  uint32_t app_sp = *(volatile uint32_t *)(base);         /* initial MSP    */
-  uint32_t app_pc = *(volatile uint32_t *)(base + 4u);    /* reset vector   */
+  uint32_t app_sp = *(volatile uint32_t *)(base);
+  uint32_t app_pc = *(volatile uint32_t *)(base + 4u);
 
-  /* Sanity-check the app slot: a valid image starts with a stack pointer that
-     lives in RAM. A blank slot reads 0xFFFFFFFF, so this rejects "no app". */
-  if (app_sp < RAM_START || app_sp > RAM_END)
-    return;                                 /* fall through -> caller hangs  */
+  if (app_sp < RAM_START || app_sp > RAM_END) return;   /* blank/invalid slot */
 
   __disable_irq();
-
-  /* Undo the little we (and SystemInit) might have left running, so the app
-     starts from a clean core state. */
+  /* Leave clocks at the HSI reset default (HAL_Init didn't change them); the
+     app's SystemClock_Config sets up HSE/PLL from any state - same as a cold
+     boot. Just stop the SysTick we started so it can't fire into the app. */
   SysTick->CTRL = 0;
   SysTick->LOAD = 0;
   SysTick->VAL  = 0;
 
-  SCB->VTOR = base;                         /* point the core at the app VT  */
+  SCB->VTOR = base;
   __DSB();
   __ISB();
-
-  __set_MSP(app_sp);                        /* adopt the app's stack         */
-
-  /* Re-enable interrupts so the app starts exactly as a hardware reset would
-     leave it (PRIMASK=0). Without this the app inherits our __disable_irq(),
-     SysTick never fires, uwTick never advances, and every HAL_Delay() hangs
-     forever - the app runs but appears dead. */
-  __enable_irq();
-
-  ((void (*)(void))app_pc)();               /* branch to the app reset handler */
+  __set_MSP(app_sp);
+  __enable_irq();                       /* app expects PRIMASK=0 (see B1 note) */
+  ((void (*)(void))app_pc)();
 }
 
 int main(void)
 {
+  HAL_Init();                           /* HSI ~16 MHz, SysTick for HAL timeouts */
+  bkp_access_enable();
+
+  if (apply_flag_read() == OTA_APPLY_MAGIC)
+  {
+    apply_flag_clear();                 /* one-shot: clear BEFORE work so a failed
+                                           apply can't loop forever */
+    maybe_apply_update();
+  }
+
   jump_to_app(APP_BASE);
 
-  /* Only reached if the app slot is invalid/blank. Hang so J-Link can attach
-     and recover rather than looping into random flash. (B3 will fall back to
-     the golden image here instead of hanging.) */
-  while (1)
-  {
-    __NOP();
-  }
+  /* Only reached if the app slot is invalid. Hang for SWD recovery. */
+  while (1) { __NOP(); }
 }

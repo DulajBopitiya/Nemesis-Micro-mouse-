@@ -2357,9 +2357,24 @@ static void cmd_ota(int argc, char **argv)
   {
     cprintf("OTA incoming: %s\r\n", Ota_VerifyIncoming() ? "VERIFIED (crc ok)" : "INVALID");
   }
+  else if (ci_eq(sub, "apply"))
+  {
+    /* Install the staged image: only if it CRC-verifies right now, set the
+       apply flag and reset into the bootloader (which does the QSPI->app-slot
+       copy). Refuse otherwise so we never reset into an invalid update. */
+    if (!Ota_VerifyIncoming())
+    {
+      puts_("ota apply: no VALID staged image (run 'ota verify') - refusing\r\n");
+      return;
+    }
+    puts_("ota apply: staged image OK - setting apply flag, resetting into bootloader...\r\n");
+    Ota_RequestApply();
+    HAL_Delay(150);                 /* let the message flush over UART/RTT */
+    NVIC_SystemReset();             /* does not return */
+  }
   else
   {
-    puts_("usage: ota [info|verify]\r\n");
+    puts_("usage: ota [info|verify|apply]\r\n");
   }
 }
 

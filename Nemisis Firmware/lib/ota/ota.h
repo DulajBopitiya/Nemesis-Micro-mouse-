@@ -35,6 +35,12 @@
 
 #define OTA_META_MAGIC       0x4F544131u   /* "OTA1" */
 
+/* "Apply this update on next boot" handshake between the app and the bootloader.
+   The app writes OTA_APPLY_MAGIC to TAMP backup register 0 (survives a system
+   reset) then resets; the bootloader reads it, does the copy, and clears it.
+   MUST be kept in sync with the copy in bootloader/src/main.c. */
+#define OTA_APPLY_MAGIC      0x0A7A0A7Au
+
 /* Metadata record stored (erased-then-written) in a dedicated QSPI sector. */
 typedef struct
 {
@@ -72,5 +78,10 @@ bool Ota_ReadMeta(OtaMeta *meta);
 /** Re-verify the incoming slot against its stored metadata (independent CRC
  *  read-back). Returns true iff metadata is VALID and the CRC still matches. */
 bool Ota_VerifyIncoming(void);
+
+/** Set the "apply on next boot" flag (TAMP backup reg 0). The caller then
+ *  resets (NVIC_SystemReset) so the bootloader copies the staged image into the
+ *  app slot. Does NOT itself reset. Only call after Ota_VerifyIncoming(). */
+void Ota_RequestApply(void);
 
 #endif /* OTA_H */

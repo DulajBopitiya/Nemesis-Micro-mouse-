@@ -129,6 +129,18 @@ bool Ota_FinishStage(uint32_t expected_crc, uint32_t *out_crc, uint32_t *out_rec
   return crc_ok;
 }
 
+void Ota_RequestApply(void)
+{
+  /* Unlock backup-domain write access and clock the RTC/TAMP register
+     interface, then latch the flag. TAMP backup registers survive a system
+     reset (they're in the always-on backup domain), so the bootloader sees it
+     after the reset the caller issues next. */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_RTCAPB_CLK_ENABLE();
+  TAMP->BKP0R = OTA_APPLY_MAGIC;
+}
+
 bool Ota_VerifyIncoming(void)
 {
   OtaMeta m;

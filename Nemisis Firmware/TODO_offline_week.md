@@ -126,7 +126,20 @@ memory `ota-external-flash-plan.md`.
       `__enable_irq()` before the jump or the app inherits PRIMASK=1, SysTick
       never fires, every HAL_Delay hangs (app runs but looks dead — diagnosed
       via J-Link: PC stuck in HAL_GetTick). After fix: full menu/sensors work.
-- [ ] B2 bootloader (bottom of flash, never OTA'd): entry via RTC-backup
+- [x] **B2 — the installer (2026-07-07, HW-PROVEN via J-Link): OTA FUNCTIONALLY
+      COMPLETE.** `ota apply` verifies the staged image, sets TAMP BKP0R apply
+      flag, resets. Bootloader (now brings up HSI+QSPI+FLASH): if flag set +
+      QSPI image CRC-valid → erase app slot → copy QSPI→0x08008000 (doubleword
+      program) → verify → clear flag → jump. **BUG found+fixed:** bootloader
+      needs its own `SysTick_Handler`→HAL_IncTick (HAL_Init enables SysTick; a
+      HAL_QSPI/FLASH timeout loop can't expire without a ticking uwTick → the
+      apply path hung with RED LEDs; normal boot was fine since it does no HAL
+      waits). After fix: full apply verified (set BKP0R via `tools/set_apply.jlink`
+      → app boots from the freshly-copied slot, PC free-running). App-side file
+      dialog defaults to app_ota build (the only OTA-installable image).
+- [ ] B3 (robustness): golden image + boot-confirm + auto-rollback so a bad/
+      power-lost apply can't strand the app slot. (B2 is single-slot: SWD net.)
+- [ ] (was) B2 bootloader (bottom of flash, never OTA'd): entry via RTC-backup
       flag + reset; receive image over PC4/PC5; CRC-verify in external flash; copy to
       internal app slot; jump. Keep a golden image in external flash for rollback
 - [ ] Move app start + set VTOR; ESP-side flashing protocol (reuse chunked transfer);
