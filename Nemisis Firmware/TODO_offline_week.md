@@ -31,8 +31,13 @@ robot. `bash test/solver_sim/run_tests.sh`. See `test/solver_sim/README.md`.**
       reproduces the real fast-run crash signature → confirms P3 is the priority
 - [x] Save a fixed sim test-set so future changes are regression-checked — the script
       + bundled mazes are the permanent net (exit 1 on any solve regression)
-- [ ] flood-fill **timing + RAM on 16×16** stays MCU-only (host has no cycle counter):
-      run the on-MCU `sim stats` when the robot's powered — carry-over bench task
+- [x] flood-fill **timing + RAM on 16×16** MCU-confirmed (2026-07-07): `maze 16` +
+      `sim stats 30` (mode 0, no faults) → reached 30/30, found-optimal 30/30
+      (learned=optimal=79), explored 80/256, **worst_us=1182** (1.18 ms worst-case
+      per-decision flood-fill). Runs in the main loop between cells (the 1 kHz control
+      ISR preempts it, PID never starved) → <2% of a cell's traversal time = huge
+      margin. RAM: 16×16 arrays are statically sized into the build (image links at
+      RAM 65.2% WITH the full solver, ~35% headroom). No re-architecture needed.
 
 ## P3 — Drift root cause  *(the thing crashing the fast run)*
 - [x] **Offline: quantified drift across all 21 fast-run logs (2026-07-06)** via
@@ -77,8 +82,14 @@ robot. `bash test/solver_sim/run_tests.sh`. See `test/solver_sim/README.md`.**
 `control.c` is a patchwork from this session (stall guards, front-stop variants, creep,
 reverted-then-re-added bits). Safety net = `sim` + build.
 
-- [ ] Map + document the move/finish/stall/front-stop state machine
+- [x] Map + document the move/finish/stall/front-stop state machine (2026-07-07):
+      `docs/CONTROL_STATE_MACHINE.md` — two exec contexts (1 kHz ISR vs main-loop
+      tasks), the ISR pipeline order, all mode flags + sub-mode owners, the move/arc/
+      pivot blocks, done-flag handshake, and a §7 cleanup checklist for the next item
+      (front-wall reads fragmented across 5 predicates, 2 copy-paste stall guards, the
+      3-way finish predicate, bench-only toggles to confirm). Read-only, no behaviour change.
 - [ ] Remove dead paths, unify the front-wall reads, add comments
+      *(checklist in docs/CONTROL_STATE_MACHINE.md §7)*
 - [ ] Confirm no behaviour change (build size + sim regression)
 
 ## P5 — Sim-developable features
