@@ -1,0 +1,13 @@
+// Simulate `ota rollback`: set TAMP BKP0R to the rollback magic, then reset into
+// the bootloader (restores the golden image; safe no-op if golden is empty).
+si SWD
+speed 4000
+device STM32G474RE
+connect
+h
+w4 0x40021058, 0x10000400
+w4 0x40007000, 0x00000100
+w4 0x40002500, 0x0B0B0B0B
+r
+g
+qc

@@ -42,6 +42,7 @@ from recorder import Recorder
 from protocol import parse_event
 from theme import apply_theme, accent
 import serial_provision
+from ota_upload import OtaUploader
 
 # ----------------------------------------------------------------------------
 # Telemetry parsing: turn console text lines into numeric series for plotting.
@@ -563,6 +564,15 @@ class LinkBridge(QtCore.QObject):
 
 
 # ----------------------------------------------------------------------------
+# Marshal OTA worker-thread callbacks onto the Qt GUI thread (queued signals).
+# ----------------------------------------------------------------------------
+class OtaSignals(QtCore.QObject):
+    progress = Signal(int, int)     # (bytes done, total)
+    log = Signal(str)
+    done = Signal(bool, str)        # (ok, error-or-empty)
+
+
+# ----------------------------------------------------------------------------
 # Rolling data store per group/series, feeding the live plot.
 # ----------------------------------------------------------------------------
 class Series:
@@ -835,6 +845,26 @@ class MainWindow(QtWidgets.QMainWindow):
             "Point the mouse at a different WiFi router without reflashing"
         )
         self.wifi_setup_btn.clicked.connect(self._wifi_setup_clicked)
+        self.build_push_btn = QtWidgets.QPushButton("Build & push")
+        self.build_push_btn.setToolTip(
+            "Build the app_ota firmware and push it over WiFi in one click"
+        )
+        self.build_push_btn.clicked.connect(self._build_push_clicked)
+        self.ota_btn = QtWidgets.QPushButton("Update firmware…")
+        self.ota_btn.setToolTip(
+            "Stage an existing firmware .bin into the mouse's QSPI flash over WiFi"
+        )
+        self.ota_btn.clicked.connect(self._ota_clicked)
+        # Recovery menu: save the running firmware as the golden fallback, or
+        # roll back to it (see `ota golden` / `ota rollback` in the firmware).
+        self.recovery_btn = QtWidgets.QToolButton()
+        self.recovery_btn.setText("Recovery ▾")
+        self.recovery_btn.setToolTip("Golden-image backup and rollback")
+        self.recovery_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        _rmenu = QtWidgets.QMenu(self.recovery_btn)
+        _rmenu.addAction("Save running firmware as golden", self._golden_clicked)
+        _rmenu.addAction("Roll back to golden…", self._rollback_clicked)
+        self.recovery_btn.setMenu(_rmenu)
         self.status_lbl = QtWidgets.QLabel("● disconnected")
         # persistent battery status indicator (voltage / SoC / safety state)
         self.batt_lbl = QtWidgets.QLabel("🔋 —")
@@ -845,6 +875,9 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.port_edit)
         bar.addWidget(self.connect_btn)
         bar.addWidget(self.wifi_setup_btn)
+        bar.addWidget(self.build_push_btn)
+        bar.addWidget(self.ota_btn)
+        bar.addWidget(self.recovery_btn)
         bar.addStretch(1)
         bar.addWidget(self.batt_lbl)
         bar.addSpacing(16)
@@ -1813,6 +1846,195 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = WifiSetupDialog(self, connected=bool(self.bridge and self.bridge.link.connected))
         dlg.portalRequested.connect(lambda: self._send("##WIFI_SETUP##"))
         dlg.exec()
+
+    # Path to the OTA-relocated build output (env:app_ota). That's the image the
+    # bootloader copies to 0x08008000; the normal nucleo_g474re build is
+    # 0x08000000-based and would crash if installed into the app slot.
+    def _app_ota_bin(self) -> Path:
+        return (Path(__file__).resolve().parent.parent
+                / "Nemisis Firmware" / ".pio" / "build" / "app_ota" / "firmware.bin")
+
+    def _firmware_dir(self) -> Path:
+        return Path(__file__).resolve().parent.parent / "Nemisis Firmware"
+
+    def _build_push_clicked(self):
+        """One click: build the app_ota env with PlatformIO, then stage+offer to
+        install the fresh firmware.bin. Removes the 'did I build the right env?'
+        footgun - the app always pushes exactly what it just built."""
+        if not (self.bridge and self.bridge.link.connected):
+            self._log("[not connected]")
+            return
+
+        prog = QtWidgets.QProgressDialog("Building firmware (pio run -e app_ota)…",
+                                         None, 0, 0, self)   # 0,0 = busy spinner
+        prog.setWindowTitle("Build & push")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setCancelButton(None)
+        prog.setValue(0)
+
+        sig = OtaSignals(self)
+
+        def _done(ok: bool, err: str):
+            prog.close()
+            if ok:
+                self._log("[ota] build OK — staging fresh firmware")
+                self._ota_stage_path(str(self._app_ota_bin()))
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "Build & push", f"Build failed:\n\n{err}\n\n"
+                    "See the console log for the full PlatformIO output.")
+
+        sig.log.connect(self._log)
+        sig.done.connect(_done)
+        self._build_sig = sig
+        self._run_pio_build_async(lambda ok, err: sig.done.emit(ok, err or ""),
+                                  lambda m: sig.log.emit(m))
+
+    def _run_pio_build_async(self, on_done, on_log):
+        """Run `pio run -e app_ota` in a worker thread, streaming output to the
+        console log. Resolves the PlatformIO executable from the standard penv
+        location, falling back to `pio`/`platformio` on PATH."""
+        import subprocess
+
+        def find_pio() -> str:
+            home = Path.home() / ".platformio" / "penv"
+            for c in (home / "Scripts" / "platformio.exe", home / "bin" / "platformio"):
+                if c.exists():
+                    return str(c)
+            return "pio"
+
+        def worker():
+            try:
+                pio = find_pio()
+                on_log(f"[build] {pio} run -e app_ota")
+                proc = subprocess.Popen(
+                    [pio, "run", "-e", "app_ota"],
+                    cwd=str(self._firmware_dir()),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1)
+                tail = []
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        on_log(f"[build] {line}")
+                        tail.append(line)
+                        if len(tail) > 6:
+                            tail.pop(0)
+                rc = proc.wait()
+                if rc == 0:
+                    on_done(True, None)
+                else:
+                    on_done(False, "\n".join(tail) or f"pio exited {rc}")
+            except Exception as e:  # noqa: BLE001
+                on_done(False, str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ota_clicked(self):
+        """Stage a firmware .bin into the mouse's external QSPI flash over the
+        WiFi link (staging + CRC verify; then offer to install). Lets you pick
+        any .bin; for the usual flow use Build & push instead."""
+        if not (self.bridge and self.bridge.link.connected):
+            self._log("[not connected]")
+            return
+
+        guess = self._app_ota_bin()
+        default_dir = str(guess) if guess.exists() else ""
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select firmware image (app_ota build)", default_dir,
+            "Firmware image (*.bin);;All files (*)")
+        if not path:
+            return
+        self._ota_stage_path(path)
+
+    def _golden_clicked(self):
+        """Save the currently-running (last-staged) firmware as the golden
+        rollback image. Best done right after a good update, when the staged
+        image == what's running. Sends `ota golden`."""
+        if not (self.bridge and self.bridge.link.connected):
+            self._log("[not connected]")
+            return
+        ok = QtWidgets.QMessageBox.question(
+            self, "Save as golden",
+            "Save the last-staged firmware as the golden rollback image?\n\n"
+            "Do this right after a successful update, so 'Roll back' returns to "
+            "this known-good build. Takes a second or two on the mouse.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes)
+        if ok == QtWidgets.QMessageBox.Yes:
+            self._send("ota golden")
+
+    def _rollback_clicked(self):
+        """Restore the golden image. Sends `ota rollback` (mouse resets into the
+        bootloader, copies golden -> app slot, reboots)."""
+        if not (self.bridge and self.bridge.link.connected):
+            self._log("[not connected]")
+            return
+        ok = QtWidgets.QMessageBox.warning(
+            self, "Roll back firmware",
+            "Restore the golden (known-good) firmware?\n\n"
+            "The mouse resets into the bootloader, copies the golden image into "
+            "place, and reboots. The link drops briefly and reconnects.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if ok == QtWidgets.QMessageBox.Yes:
+            self._log("[ota] rolling back to golden — mouse resetting…")
+            self._send("ota rollback")
+
+    def _ota_stage_path(self, path: str):
+        """Stage the given .bin into QSPI over WiFi, then offer to install it.
+        Shared by Update firmware… and Build & push."""
+        prog = QtWidgets.QProgressDialog("Staging firmware to QSPI…", "Cancel",
+                                         0, 100, self)
+        prog.setWindowTitle("Update firmware")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setAutoClose(False)
+        prog.setAutoReset(False)
+        prog.setValue(0)
+
+        sig = OtaSignals(self)
+
+        def _on_progress(done: int, total: int):
+            pct = int(done * 100 / total) if total else 0
+            prog.setValue(pct)
+            prog.setLabelText(f"Staging firmware to QSPI…  {done}/{total} bytes")
+
+        def _on_done(ok: bool, err: str):
+            prog.close()
+            if ok:
+                self._log("[ota] firmware staged + verified in QSPI ✓")
+                choice = QtWidgets.QMessageBox.question(
+                    self, "Install firmware?",
+                    "Image staged and CRC-verified in external flash "
+                    "(LEDs went green on the mouse).\n\n"
+                    "Install it now? The mouse will reset into the bootloader, "
+                    "copy the new firmware into place (a few seconds), and reboot. "
+                    "The link will drop briefly and reconnect.",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.Yes)
+                if choice == QtWidgets.QMessageBox.Yes:
+                    self._log("[ota] applying update — mouse resetting into bootloader…")
+                    self._send("ota apply")
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "Update firmware", f"Staging failed:\n\n{err}")
+
+        sig.progress.connect(_on_progress)
+        sig.log.connect(self._log)
+        sig.done.connect(_on_done)
+
+        up = OtaUploader(
+            self.bridge.link, path,
+            on_progress=lambda d, t: sig.progress.emit(d, t),
+            on_log=lambda m: sig.log.emit(m),
+        )
+        prog.canceled.connect(up.cancel)
+        # keep refs alive for the duration of the transfer
+        self._ota_sig = sig
+        self._ota_up = up
+        up.upload_async(lambda ok, err: sig.done.emit(ok, err or ""))
 
     # -- connection --------------------------------------------------------
     def _toggle_connect(self):

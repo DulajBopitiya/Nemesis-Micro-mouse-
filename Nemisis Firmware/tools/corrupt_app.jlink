@@ -1,0 +1,17 @@
+// B3.2 auto-rescue test (COLLABORATIVE - run only AFTER golden is populated:
+// in the app, apply a firmware then Recovery -> Save as golden, so both the
+// golden image and the current-app metadata exist).
+//
+// This deliberately erases one 2 KB page in the middle of the app slot to
+// simulate a corrupted / power-lost-mid-copy app image, then resets. On boot the
+// bootloader's validate_and_recover() should notice app-slot CRC != current-meta
+// and automatically restore the golden image -> the mouse boots healthy again.
+si SWD
+speed 4000
+device STM32G474RE
+connect
+h
+erase 0x08020000 0x08020800
+r
+g
+qc

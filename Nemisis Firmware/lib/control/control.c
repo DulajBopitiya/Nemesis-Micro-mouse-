@@ -365,6 +365,17 @@ static bool     nav_seq_done_ok;           /* false = aborted (battery gate)    
    head_setpoint is slewed to head_target; the heading PID does the rotating. */
 static volatile bool    pivot_mode;
 static bool             pivot_snappy;      /* fast-run: finish pivots early (no settle sit) */
+/* Heading carry (hcarry): the pinned drift root cause. Control_Start re-zeros
+   heading_deg every primitive, so a pivot that releases a few deg SHORT (snappy
+   early-release / PID lag) hands the next straight a skewed heading it then adopts
+   as "straight ahead" - the ~8-11 deg under-rotate debt from analyze_drift. When
+   ON, a completed mid-run turn stashes its residual (achieved - target); the NEXT
+   Control_Start seeds heading_deg with it (setpoint stays 0), so that segment
+   rotates the debt back out while moving instead of banking it. Reversible toggle
+   (default ON) so the bench can A/B the old zero-reset behaviour. */
+static bool             head_carry_en = true;
+static float            head_residual;        /* pending carry, deg (achieved-target) */
+static bool             head_residual_pending;/* a completed turn left a debt to carry */
 static float            head_setpoint;     /* heading PID setpoint (deg); 0 = straight */
 static float            head_target;       /* final commanded angle (deg)        */
 static float            turn_sgn;          /* +/-1: sign of head_target          */
@@ -1383,6 +1394,14 @@ static void control_tick(void)
     {
       turn_done_deg  = (int32_t)heading_deg;
       turn_done_flag = true;
+      /* hcarry: stash the under-rotate debt for the next segment (mid-run only, so
+         single-shot console pivots are unaffected). Snappy/timeout release SHORT of
+         head_target; a clean release makes this ~0 (harmless). */
+      if (seq_skip_gyro_cal)
+      {
+        head_residual         = heading_deg - head_target;   /* signed; sign-symmetric */
+        head_residual_pending = true;
+      }
       /* latch per-turn diagnostics (see TURNDIAG). angles/rate in deci-units. */
       td_cmd_ddeg  = (int32_t)(head_target   * 10.0f);
       td_ach_ddeg  = (int32_t)(heading_deg   * 10.0f);
@@ -1755,6 +1774,7 @@ void Control_RunBegin(void)
 {
   calibrate_gyro_bias();               /* robot must be stationary here          */
   seq_skip_gyro_cal = true;
+  head_residual_pending = false;       /* no carry into the run's first primitive */
 }
 void Control_RunEnd(void)
 {
@@ -1775,7 +1795,11 @@ bool Control_Start(int target)
   pid_reset(&pid_lvel);
   pid_reset(&pid_rvel);
   pid_reset(&pid_head);
-  heading_deg     = 0.0f;
+  /* hcarry: mid-run, seed the residual from the previous turn instead of zeroing so
+     this segment drives the under-rotate debt back to 0 (head_setpoint stays 0). */
+  heading_deg     = (head_carry_en && seq_skip_gyro_cal && head_residual_pending)
+                    ? head_residual : 0.0f;
+  head_residual_pending = false;
   enc_diff_counts = 0;
   picked_up       = false;             /* fresh run clears any prior lift latch */
   pickup_ticks    = 0;
@@ -2300,6 +2324,12 @@ void Control_SetFrontStop(bool enable) { front_stop_en = enable; }
    next cell's forward flow trims the residual. Off = the tight search completion. */
 void Control_SetPivotSnappy(bool on) { pivot_snappy = on; }
 bool Control_GetPivotSnappy(void)    { return pivot_snappy; }
+
+/* Heading carry (hcarry): carry a turn's under-rotate residual into the next
+   mid-run segment instead of re-zeroing the heading reference. Default ON = the
+   drift fix; OFF restores the old per-segment zero-reset for an A/B bench compare. */
+void Control_SetHeadingCarry(bool on) { head_carry_en = on; if (!on) head_residual_pending = false; }
+bool Control_GetHeadingCarry(void)    { return head_carry_en; }
 
 bool Control_StartAdvance(int cells, int target_cps)
 {

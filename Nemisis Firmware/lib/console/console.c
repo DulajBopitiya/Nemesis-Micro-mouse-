@@ -18,6 +18,9 @@
 #include "sensors.h"
 #include "solver.h"
 #include "mazestore.h"
+#include "qspiflash.h"
+#include "ota.h"
+#include "ws2812.h"       /* 4 RGB LEDs = OTA transfer/verify indicator */
 
 #include <string.h>
 #include <stdarg.h>
@@ -29,6 +32,7 @@
 static const ConsoleCtx *C;          /* bound handles */
 
 static AS5047P_Handle encL, encR;    /* the two magnetic encoders on SPI3 */
+static bool qspi_ok;                 /* W25Q32JW probed OK at boot (OTA flash) */
 
 /* Live-stream selector. Action commands (motor/vacuum/buzzer) are one-shot
    and leave the mode at IDLE. */
@@ -52,7 +56,7 @@ static int     last_term;            /* to swallow the LF in a CR/LF pair */
    received byte is lost. The handler is USART1_IRQHandler (this board's bridge
    UART is USART1); it overrides the weak default in the startup file. */
 #define TXR_SZ 2048U                 /* power-of-two not required, plain modulo */
-#define RXR_SZ 256U
+#define RXR_SZ 1024U                 /* headroom for OTA receive bursts (was 256) */
 static volatile uint8_t  txr[TXR_SZ];
 static volatile uint16_t txr_head, txr_tail;
 static volatile uint8_t  rxr[RXR_SZ];
@@ -1577,12 +1581,17 @@ static void cmd_arc(int argc, char **argv)
  *      TURNDIAG,idx,cmd_ddeg,ach_ddeg,resid_ddeg,peak_ddps,ms,reason
  *  (angles/rate x10; resid = ach-cmd, <0 = under-rotated; reason 0 clean /
  *   1 snappy early-release / 2 timeout), then at the end:
- *      TURNSUM,turns,cum_resid_ddeg,mean_resid_ddeg
- *  cum_resid is the total drift after all N turns (perfect = 0).
+ *      TURNSUM,turns,cum_resid_ddeg,mean_resid_ddeg,drift_ddeg
+ *  cum_resid = sum of per-turn in-frame shortfalls (raw under-rotate, hcarry-invariant);
+ *  drift = true accumulated heading - ideal (turns*deg) = the ACTUAL error the mouse
+ *  carries out of the sequence. hcarry ON drives drift -> ~one turn's worth even though
+ *  cum_resid is unchanged. (drift field is optional; older 3-field logs still parse.)
  * ======================================================================== */
 static bool    bench_active;
 static int     bench_remaining, bench_deg, bench_cps, bench_idx;
 static int32_t bench_cum_ddeg;
+static int32_t bench_prev_resid;   /* previous turn's in-frame residual (deci-deg)   */
+static int32_t bench_phys_ddeg;    /* true cumulative PHYSICAL rotation (deci-deg)    */
 
 static void bench_task(void)
 {
@@ -1594,6 +1603,14 @@ static void bench_task(void)
   Control_GetLastTurnDiag(&cmd, &ach, &pk, &ms, &rs, &pl, &pr);
   int32_t resid = ach - cmd;                      /* deci-deg, <0 = under-rotated  */
   bench_cum_ddeg += resid;
+  /* True PHYSICAL rotation this turn. With hcarry ON, turn k>0 is SEEDED with the
+     previous turn's residual (heading_deg starts offset by that), so it physically
+     spins the debt back out; the reported 'ach' is in that carried frame and stays
+     ~constant, hiding the correction. The real spin = ach - seed. Summing it gives
+     the actual accumulated heading, which is what the fix moves. */
+  int32_t seed = (bench_idx > 0 && Control_GetHeadingCarry()) ? bench_prev_resid : 0;
+  bench_phys_ddeg += (ach - seed);
+  bench_prev_resid = resid;
   cprintf("TURNDIAG,%d,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld\r\n",
           bench_idx, (long)cmd, (long)ach, (long)resid, (long)pk, (long)ms, (long)rs,
           (long)pl, (long)pr);
@@ -1601,12 +1618,18 @@ static void bench_task(void)
 
   if (--bench_remaining <= 0)
   {
-    cprintf("TURNSUM,%d,%ld,%ld\r\n> ", bench_idx, (long)bench_cum_ddeg,
-            (long)(bench_idx ? bench_cum_ddeg / bench_idx : 0));
+    /* cum_resid = sum of per-turn in-frame shortfalls (the raw under-rotate signal,
+       unchanged by hcarry). drift = true accumulated heading - ideal (idx*deg) = how
+       far the robot is ACTUALLY off after the whole sequence. hcarry drives drift ->
+       ~one turn's worth while cum_resid keeps reporting the per-turn shortfall. */
+    int32_t drift = bench_phys_ddeg - (int32_t)bench_idx * bench_deg * 10;
+    cprintf("TURNSUM,%d,%ld,%ld,%ld\r\n> ", bench_idx, (long)bench_cum_ddeg,
+            (long)(bench_idx ? bench_cum_ddeg / bench_idx : 0), (long)drift);
+    Control_RunEnd();                             /* close the run / hcarry window */
     bench_active = false;
     return;
   }
-  Control_StartPivot(bench_deg, bench_cps);       /* next turn                     */
+  Control_StartPivot(bench_deg, bench_cps);       /* next turn (seeded if hcarry)  */
 }
 
 static void cmd_benchturn(int argc, char **argv)
@@ -1625,8 +1648,11 @@ static void cmd_benchturn(int argc, char **argv)
 
   bench_deg = deg; bench_cps = rate; bench_remaining = n;
   bench_idx = 0; bench_cum_ddeg = 0;
+  bench_prev_resid = 0; bench_phys_ddeg = 0;
+  Control_RunBegin();                 /* one gyro cal + open the hcarry gate, as a real run */
   if (!Control_StartPivot(deg, rate))
   {
+    Control_RunEnd();                 /* battery gate: undo the run window we just opened */
     cprintf("BATTERY %s - benchturn disabled.\r\n", Battery_StateName(Battery_State()));
     return;
   }
@@ -2147,6 +2173,296 @@ static void cmd_tlm(int argc, char **argv)
   cprintf("telemetry %s for %s loop\r\n", on ? "ON" : "off", argv[1]);
 }
 
+/* W25Q32JW OTA-staging flash on QUADSPI1. Bring-up + diagnostics:
+     qspi [id]            read + interpret the JEDEC id (bus-alive proof)
+     qspi status          dump Status Register 1 (WIP/WEL)
+     qspi read <addr> [n] hex-dump n bytes from hex addr (n<=256, default 64)
+     qspi test            DESTRUCTIVE erase/program/verify round-trip on the
+                          last 4 KB sector (scratch, never an OTA slot) */
+static void cmd_qspi(int argc, char **argv)
+{
+  const char *sub = (argc >= 2) ? argv[1] : "id";
+
+  if (ci_eq(sub, "id"))
+  {
+    QSpiFlash_ID id;
+    if (!QSpiFlash_ReadID(&id)) { puts_("qspi: ID read FAILED (bus error)\r\n"); return; }
+    cprintf("QSPI id: mfr=0x%02X type=0x%02X cap=0x%02X",
+            id.mfr, id.mem_type, id.capacity);
+    if (id.mfr == QSPIFLASH_MFR_WINBOND && id.capacity == QSPIFLASH_CAP_32MBIT)
+      puts_("  -> Winbond W25Q32 (4 MB) OK\r\n");
+    else
+      puts_("  -> UNRECOGNISED (expected EF/60/16)\r\n");
+  }
+  else if (ci_eq(sub, "status"))
+  {
+    uint8_t sr1;
+    if (!QSpiFlash_ReadStatus(&sr1)) { puts_("qspi: status read FAILED\r\n"); return; }
+    cprintf("QSPI SR1=0x%02X (WIP=%d WEL=%d)\r\n",
+            sr1, (int)(sr1 & 1u), (int)((sr1 >> 1) & 1u));
+  }
+  else if (ci_eq(sub, "read"))
+  {
+    if (argc < 3) { puts_("usage: qspi read <hexaddr> [n]\r\n"); return; }
+    uint32_t addr = (uint32_t)strtoul(argv[2], NULL, 16);
+    uint32_t n    = (argc >= 4) ? (uint32_t)strtoul(argv[3], NULL, 0) : 64u;
+    if (n > 256u) n = 256u;
+    uint8_t buf[256];
+    if (!QSpiFlash_Read(addr, buf, n)) { puts_("qspi: read FAILED (range?)\r\n"); return; }
+    for (uint32_t i = 0; i < n; i += 16u)
+    {
+      cprintf("%06lX:", (unsigned long)(addr + i));
+      for (uint32_t j = 0; j < 16u && (i + j) < n; j++) cprintf(" %02X", buf[i + j]);
+      puts_("\r\n");
+    }
+  }
+  else if (ci_eq(sub, "test"))
+  {
+    /* Round-trip on the LAST sector - scratch space, never an OTA image slot. */
+    const uint32_t addr = QSPIFLASH_CHIP_SIZE - QSPIFLASH_SECTOR_SIZE;
+    uint8_t buf[64], pat[64];
+
+    cprintf("QSPI self-test @0x%06lX (erase+program+verify)...\r\n",
+            (unsigned long)addr);
+    if (!QSpiFlash_EraseSector(addr)) { puts_("  erase FAILED\r\n"); return; }
+    if (!QSpiFlash_Read(addr, buf, sizeof buf)) { puts_("  read-after-erase FAILED\r\n"); return; }
+    for (int i = 0; i < 64; i++)
+      if (buf[i] != 0xFF) { cprintf("  erase-verify FAILED @%d=0x%02X\r\n", i, buf[i]); return; }
+
+    for (int i = 0; i < 64; i++) pat[i] = (uint8_t)(i * 7 + 3);
+    if (!QSpiFlash_Write(addr, pat, sizeof pat)) { puts_("  program FAILED\r\n"); return; }
+    if (!QSpiFlash_Read(addr, buf, sizeof buf)) { puts_("  read-back FAILED\r\n"); return; }
+    for (int i = 0; i < 64; i++)
+      if (buf[i] != pat[i]) { cprintf("  verify FAILED @%d got=0x%02X want=0x%02X\r\n", i, buf[i], pat[i]); return; }
+
+    puts_("  PASS - erase/program/read round-trip OK\r\n");
+  }
+  else
+  {
+    puts_("usage: qspi [id|status|read <addr> [n]|test]\r\n");
+  }
+}
+
+/* ---- OTA firmware receive (Tier A: stage into QSPI, no jump) --------------
+   Protocol (base64 payload so it can never contain the ESP bridge's '##...##'
+   magic; ACK-gated so the 256->1024 B RX ring + ~400 ms sector erase can't
+   overrun the transfer):
+     app -> otarx <size> <crc32hex>
+     mcu -> OTARX,READY,<maxchunk>        (or OTARX,ERR,...)
+     app -> <base64 line>   (payload <= OTA_CHUNK_MAX bytes decoded)
+     mcu -> OTARX,ACK,<total>             (per line; NAK/ERR on failure)
+     ...repeat until <total> == size...
+     app -> OTAEND                        (optional; mcu also finishes on size)
+     mcu -> OTARX,DONE,OK,crc=...,rx=...   | OTARX,DONE,CRCFAIL,got=...,want=...
+   Blocking foreground op (motors idle); the 1 kHz control + UART RX ISRs keep
+   running, so timing/telemetry are unaffected. */
+#define OTA_CHUNK_MAX  384           /* multiple of 3 -> base64 = 512 chars, no '=' */
+#define OTA_LINE_MAX   544           /* >= 512 base64 chars + NUL + slack           */
+#define OTA_RX_TMO_MS  8000u
+
+static int b64_val(int c)
+{
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+/* Decode base64 `src` (len chars) into `dst`. Returns byte count, or -1 on a
+   bad character / overflow. '=' padding and trailing NUL end the input. */
+static int b64_decode(const char *src, int len, uint8_t *dst, int dstmax)
+{
+  int out = 0, bits = 0, acc = 0;
+  for (int i = 0; i < len; i++)
+  {
+    int c = src[i];
+    if (c == '=' || c == '\0') break;
+    int v = b64_val(c);
+    if (v < 0) return -1;
+    acc = (acc << 6) | v;
+    bits += 6;
+    if (bits >= 8)
+    {
+      bits -= 8;
+      if (out >= dstmax) return -1;
+      dst[out++] = (uint8_t)((acc >> bits) & 0xFF);
+    }
+  }
+  return out;
+}
+
+/* Read one line (bytes until '\n', '\r' ignored) via read_byte() with an
+   inter-byte timeout. Returns length, or -1 on timeout. No echo (OTA is bulk).*/
+static int ota_read_line(char *buf, int max, uint32_t timeout_ms)
+{
+  int n = 0;
+  uint32_t last = HAL_GetTick();
+  for (;;)
+  {
+    int c = read_byte();
+    if (c < 0)
+    {
+      if ((HAL_GetTick() - last) > timeout_ms) return -1;
+      continue;
+    }
+    last = HAL_GetTick();
+    if (c == '\n' || c == '\r') { buf[n] = '\0'; return n; } /* CR or LF ends it */
+    if (n < max - 1) buf[n++] = (char)c;
+    /* overflow: keep consuming to the terminator; decode will reject it */
+  }
+}
+
+/* OTA progress/result on the 4 RGB LEDs. During receive they fill blue as bytes
+   arrive (each LED ~= 25% of the image); solid green when the image verifies,
+   solid red on any failure. The main loop's heartbeat reclaims the LEDs about a
+   second after cmd_otarx returns, so failure/success is held briefly to be seen.
+   Safe here because the whole transfer runs inside this (blocking) command, so
+   nothing else drives the LED chain meanwhile. */
+static void ota_leds(uint32_t lit, uint8_t r, uint8_t g, uint8_t b)
+{
+  if (lit > WS2812_NUM_LEDS) lit = WS2812_NUM_LEDS;
+  for (uint32_t i = 0; i < WS2812_NUM_LEDS; i++)
+  {
+    if (i < lit) WS2812_SetPixel((uint16_t)i, r, g, b);
+    else         WS2812_SetPixel((uint16_t)i, 0, 0, 0);
+  }
+  WS2812_Show();
+}
+
+/* Flag a failed transfer: red LEDs held briefly, invalidate the slot, done. */
+static void ota_fail(const char *msg)
+{
+  puts_(msg);
+  Ota_FinishStage(0xFFFFFFFFu, NULL, NULL);   /* writes INVALID metadata */
+  ota_leds(WS2812_NUM_LEDS, 24, 0, 0);        /* all red */
+  HAL_Delay(1200);
+}
+
+static void cmd_otarx(int argc, char **argv)
+{
+  if (argc < 3)
+  {
+    puts_("usage: otarx <size> <crc32hex>\r\n");
+    return;
+  }
+  uint32_t size = (uint32_t)strtoul(argv[1], NULL, 10);
+  uint32_t crc  = (uint32_t)strtoul(argv[2], NULL, 16);
+
+  if (!Ota_BeginStage(size))
+  {
+    cprintf("OTARX,ERR,begin (size=%lu max=%lu)\r\n",
+            (unsigned long)size, (unsigned long)OTA_IMAGE_MAX);
+    ota_leds(WS2812_NUM_LEDS, 24, 0, 0);
+    HAL_Delay(1200);
+    return;
+  }
+  cprintf("OTARX,READY,%d\r\n", OTA_CHUNK_MAX);
+  ota_leds(0, 0, 0, 0);                      /* clear: transfer starting */
+
+  static char    lb[OTA_LINE_MAX];
+  static uint8_t db[OTA_CHUNK_MAX];
+  uint32_t total = 0;
+  uint32_t last_lit = 0;
+
+  while (total < size)
+  {
+    int ln = ota_read_line(lb, sizeof lb, OTA_RX_TMO_MS);
+    if (ln < 0)      { ota_fail("OTARX,ERR,timeout\r\n"); return; }
+    if (ln == 0)     { continue; }                         /* stray blank line */
+    if (ci_eq(lb, "OTAABORT")) { ota_fail("OTARX,ERR,abort\r\n"); return; }
+    if (ci_eq(lb, "OTAEND"))   { break; }
+
+    int nb = b64_decode(lb, ln, db, sizeof db);
+    if (nb <= 0)              { ota_fail("OTARX,NAK,decode\r\n"); return; }
+    if (!Ota_WriteChunk(db, (size_t)nb)) { ota_fail("OTARX,NAK,write\r\n"); return; }
+
+    total += (uint32_t)nb;
+    cprintf("OTARX,ACK,%lu\r\n", (unsigned long)total);    /* paces the sender */
+
+    /* Blue progress bar - only redraw when a whole LED's worth (~25%) fills. */
+    uint32_t lit = (uint32_t)((uint64_t)total * WS2812_NUM_LEDS / size);
+    if (lit != last_lit) { last_lit = lit; ota_leds(lit, 0, 0, 22); }
+  }
+
+  uint32_t got = 0, rx = 0;
+  bool ok = Ota_FinishStage(crc, &got, &rx);
+  if (ok)
+  {
+    cprintf("OTARX,DONE,OK,crc=%08lX,rx=%lu\r\n", (unsigned long)got, (unsigned long)rx);
+    ota_leds(WS2812_NUM_LEDS, 0, 24, 0);      /* all green: staged + verified */
+    HAL_Delay(1500);
+  }
+  else
+  {
+    cprintf("OTARX,DONE,CRCFAIL,got=%08lX,want=%08lX,rx=%lu\r\n",
+            (unsigned long)got, (unsigned long)crc, (unsigned long)rx);
+    ota_leds(WS2812_NUM_LEDS, 24, 0, 0);      /* all red: verify failed */
+    HAL_Delay(1500);
+  }
+}
+
+/* Inspect / verify the staged incoming image (independent of the receiver).
+     ota info    - print the stored metadata (size/crc/status)
+     ota verify  - re-CRC the slot from QSPI and check against its metadata */
+static void cmd_ota(int argc, char **argv)
+{
+  const char *sub = (argc >= 2) ? argv[1] : "info";
+
+  if (ci_eq(sub, "info"))
+  {
+    cprintf("OTA golden image: %s\r\n", Ota_GoldenValid() ? "VALID (rollback ready)" : "none");
+    OtaMeta m;
+    if (!Ota_ReadMeta(&m)) { puts_("ota: meta read FAILED\r\n"); return; }
+    cprintf("OTA incoming: magic=%08lX size=%lu crc=%08lX status=%s\r\n",
+            (unsigned long)m.magic, (unsigned long)m.size, (unsigned long)m.crc32,
+            (m.status == OTA_STATUS_VALID) ? "VALID" : "INVALID");
+  }
+  else if (ci_eq(sub, "verify"))
+  {
+    cprintf("OTA incoming: %s\r\n", Ota_VerifyIncoming() ? "VERIFIED (crc ok)" : "INVALID");
+  }
+  else if (ci_eq(sub, "apply"))
+  {
+    /* Install the staged image: only if it CRC-verifies right now, set the
+       apply flag and reset into the bootloader (which does the QSPI->app-slot
+       copy). Refuse otherwise so we never reset into an invalid update. */
+    if (!Ota_VerifyIncoming())
+    {
+      puts_("ota apply: no VALID staged image (run 'ota verify') - refusing\r\n");
+      return;
+    }
+    puts_("ota apply: staged image OK - setting apply flag, resetting into bootloader...\r\n");
+    Ota_RequestApply();
+    HAL_Delay(150);                 /* let the message flush over UART/RTT */
+    NVIC_SystemReset();             /* does not return */
+  }
+  else if (ci_eq(sub, "golden"))
+  {
+    /* Save the staged (== currently running, right after an apply) image as the
+       known-good rollback target. QSPI->QSPI copy; stalls the loop ~1-2 s. */
+    puts_("ota golden: promoting staged image to golden (rollback) slot...\r\n");
+    cprintf("ota golden: %s\r\n", Ota_PromoteGolden() ? "saved OK" : "FAILED (no valid staged image?)");
+  }
+  else if (ci_eq(sub, "rollback"))
+  {
+    if (!Ota_GoldenValid())
+    {
+      puts_("ota rollback: no valid golden image - refusing\r\n");
+      return;
+    }
+    puts_("ota rollback: restoring golden image, resetting into bootloader...\r\n");
+    Ota_RequestRollback();
+    HAL_Delay(150);
+    NVIC_SystemReset();
+  }
+  else
+  {
+    puts_("usage: ota [info|verify|apply|golden|rollback]\r\n");
+  }
+}
+
 /* ====================== dispatcher ====================================== */
 
 static void dispatch(char *s)
@@ -2177,6 +2493,7 @@ static void dispatch(char *s)
   else if (ci_eq(cmd, "stop") || ci_eq(cmd, "s"))
   {
     stop_streams();
+    if (bench_active) Control_RunEnd();                    /* close benchturn run window */
     bench_active = false;                                  /* drop any benchturn */
     griptest_abort(NULL);                                  /* drop any grip test */
     spintest_abort(NULL);                                  /* drop any spin test */
@@ -2288,6 +2605,15 @@ static void dispatch(char *s)
       Control_SetPivotSnappy(ci_eq(argv[1], "on") || ci_eq(argv[1], "1"));
     cprintf("snappy pivots %s\r\n", Control_GetPivotSnappy() ? "ON" : "off");
   }
+  else if (ci_eq(cmd, "hcarry"))
+  {
+    /* toggle heading carry (the drift fix): carry a turn's under-rotate residual
+       into the next mid-run segment vs the old per-segment zero-reset. Lets a bench
+       run A/B the fix (hcarry off = reproduce the old ~8-11 deg cumulative drift). */
+    if (argc >= 2)
+      Control_SetHeadingCarry(ci_eq(argv[1], "on") || ci_eq(argv[1], "1"));
+    cprintf("heading carry %s\r\n", Control_GetHeadingCarry() ? "ON" : "off");
+  }
   else if (ci_eq(cmd, "arcff"))
   {
     cmd_arcff(argc, argv);
@@ -2339,6 +2665,18 @@ static void dispatch(char *s)
   else if (ci_eq(cmd, "mem"))
   {
     cmd_mem(argc, argv);
+  }
+  else if (ci_eq(cmd, "qspi"))
+  {
+    cmd_qspi(argc, argv);
+  }
+  else if (ci_eq(cmd, "otarx"))
+  {
+    cmd_otarx(argc, argv);
+  }
+  else if (ci_eq(cmd, "ota"))
+  {
+    cmd_ota(argc, argv);
   }
   else if (ci_eq(cmd, "sim"))
   {
@@ -2504,6 +2842,22 @@ void Console_Init(const ConsoleCtx *ctx)
   /* Vacuum PWM ready at 0 %. */
   HAL_TIM_PWM_Start(C->htim_fan, TIM_CHANNEL_3);
   __HAL_TIM_SET_COMPARE(C->htim_fan, TIM_CHANNEL_3, 0);
+
+  /* Probe the W25Q32JW OTA-staging flash on QUADSPI1 (binds the driver handle).
+     Non-fatal: a missing/failed chip just means OTA staging is unavailable. */
+  qspi_ok = QSpiFlash_Init(C->hqspi);
+  cprintf("QSPI flash (OTA staging): %s\r\n",
+          qspi_ok ? "W25Q32JW OK" : "NOT DETECTED (run 'qspi id')");
+
+  /* First boot after the bootloader installed an OTA update: confirm with a
+     green LED flash so it's obvious the new firmware is live. */
+  if (Ota_JustApplied())
+  {
+    puts_("OTA: update installed and running\r\n");
+    ota_leds(WS2812_NUM_LEDS, 0, 30, 0);    /* solid green */
+    HAL_Delay(1200);
+    ota_leds(0, 0, 0, 0);                    /* back to normal; heartbeat resumes */
+  }
 
   print_menu();
 }

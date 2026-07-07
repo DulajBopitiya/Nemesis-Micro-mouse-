@@ -1,0 +1,14 @@
+// Simulate `ota apply`: set the TAMP backup-reg apply flag, then reset into the
+// bootloader so it runs the QSPI->app-slot copy. RCC/PWR pokes are undone by the
+// reset; only TAMP_BKP0R (backup domain) survives a system reset.
+si SWD
+speed 4000
+device STM32G474RE
+connect
+h
+w4 0x40021058, 0x10000400
+w4 0x40007000, 0x00000100
+w4 0x40002500, 0x0A7A0A7A
+r
+g
+qc

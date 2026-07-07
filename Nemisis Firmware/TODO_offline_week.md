@@ -31,8 +31,13 @@ robot. `bash test/solver_sim/run_tests.sh`. See `test/solver_sim/README.md`.**
       reproduces the real fast-run crash signature → confirms P3 is the priority
 - [x] Save a fixed sim test-set so future changes are regression-checked — the script
       + bundled mazes are the permanent net (exit 1 on any solve regression)
-- [ ] flood-fill **timing + RAM on 16×16** stays MCU-only (host has no cycle counter):
-      run the on-MCU `sim stats` when the robot's powered — carry-over bench task
+- [x] flood-fill **timing + RAM on 16×16** MCU-confirmed (2026-07-07): `maze 16` +
+      `sim stats 30` (mode 0, no faults) → reached 30/30, found-optimal 30/30
+      (learned=optimal=79), explored 80/256, **worst_us=1182** (1.18 ms worst-case
+      per-decision flood-fill). Runs in the main loop between cells (the 1 kHz control
+      ISR preempts it, PID never starved) → <2% of a cell's traversal time = huge
+      margin. RAM: 16×16 arrays are statically sized into the build (image links at
+      RAM 65.2% WITH the full solver, ~35% headroom). No re-architecture needed.
 
 ## P3 — Drift root cause  *(the thing crashing the fast run)*
 - [x] **Offline: quantified drift across all 21 fast-run logs (2026-07-06)** via
@@ -42,10 +47,15 @@ robot. `bash test/solver_sim/run_tests.sh`. See `test/solver_sim/README.md`.**
       battery sags to 6.78V (secondary). Full write-up: memory
       `drift-log-analysis-0704-0705`. Causal chain: under-rotate → skewed cell entry
       → clip/ram → desync → crash (desync = fatal, per the sim harness).
-- [ ] **Propose ONE turn-completion fix** — correct the arc/flow-turn so it rotates
-      the commanded angle (kill the ~10° debt at source), per `smooth-turn-rework-
-      analysis` (trapezoidal-ω + fix early-release + post-turn heading-setpoint
-      handoff). Needs a read of control.c turn-completion. Single, reversible change.
+- [x] **Turn-completion fix IMPLEMENTED (2026-07-07): `hcarry` heading-carry.**
+      Single, reversible change at the pinned root cause. A mid-run pivot that
+      releases short (snappy early-release/PID lag) now stashes its residual
+      (`heading_deg - head_target`); the next `Control_Start` seeds `heading_deg`
+      with it (setpoint stays 0) so that segment rotates the debt back out while
+      moving instead of banking the skew. Scoped to auto-runs (`seq_skip_gyro_cal`),
+      captured at the pivot completion (covers plain pivots + flow-turn pivot-finish),
+      cleared at `RunBegin`. Runtime toggle `hcarry on|off` (mirrors `snappy`,
+      default ON) for bench A/B. Builds clean (nucleo_g474re + app_ota, Flash 23.1%).
 - [x] **Root cause PINNED to `control.c:1753`** (2026-07-06): `Control_Start` re-zeros
       `heading_deg` every primitive → snappy pivot releases ~4° short + ~8° PID lag,
       then the next straight adopts the shortfall as "straight ahead". Fix drafted:
@@ -53,9 +63,14 @@ robot. `bash test/solver_sim/run_tests.sh`. See `test/solver_sim/README.md`.**
 - [x] **Turn-diagnostic LOGGING built + flashable** (2026-07-06): `benchturn <n> <deg>`
       spins N pivots in place (no walls) → `TURNDIAG`/`TURNSUM` lines; `turn` emits
       `TURNDIAG,-1,...`; app parses + `analyze_turns.py`. Builds clean.
-- [ ] **Bench-verify WITHOUT walls** (doable now — user has a floor): flash, run
-      `benchturn 4 90`, read the residuals to confirm the ~8° pin. THEN implement the
-      `hcarry` fix and re-run to prove cumulative drift → ~0.
+- [x] **Bench-verified the `hcarry` fix WITHOUT walls (2026-07-07, HW-PROVEN over OTA).**
+      Made `benchturn` a real run (wraps `RunBegin/RunEnd`) so the hcarry gate opens,
+      and added a TRUE-DRIFT metric to TURNSUM (accumulated heading vs ideal) since the
+      per-turn in-frame residual is hcarry-invariant and can't show the fix. A/B @ 4×90
+      in place: `hcarry off` → cum −9.1°, **drift −9.1°**; `hcarry on` → cum −9.0°
+      (per-turn shortfall unchanged), **drift −2.1°**. Cumulative drift −77%, down to one
+      turn's un-carried residual. Confirms the ~2.2°/turn under-rotate pin AND that the
+      carry cancels its accumulation. Real-run payoff (pivot→advance) still wants a maze.
 - [x] Characterise the intermittent right-wheel stall (2026-07-06, bench): added
       per-wheel posL/posR to TURNDIAG; `benchturn 6 360` → **R/L 0.99-1.04 (balanced)**,
       battery barely sagged. Right wheel is FINE on the bench → the stall is a FULL-RUN
@@ -67,8 +82,14 @@ robot. `bash test/solver_sim/run_tests.sh`. See `test/solver_sim/README.md`.**
 `control.c` is a patchwork from this session (stall guards, front-stop variants, creep,
 reverted-then-re-added bits). Safety net = `sim` + build.
 
-- [ ] Map + document the move/finish/stall/front-stop state machine
+- [x] Map + document the move/finish/stall/front-stop state machine (2026-07-07):
+      `docs/CONTROL_STATE_MACHINE.md` — two exec contexts (1 kHz ISR vs main-loop
+      tasks), the ISR pipeline order, all mode flags + sub-mode owners, the move/arc/
+      pivot blocks, done-flag handshake, and a §7 cleanup checklist for the next item
+      (front-wall reads fragmented across 5 predicates, 2 copy-paste stall guards, the
+      3-way finish predicate, bench-only toggles to confirm). Read-only, no behaviour change.
 - [ ] Remove dead paths, unify the front-wall reads, add comments
+      *(checklist in docs/CONTROL_STATE_MACHINE.md §7)*
 - [ ] Confirm no behaviour change (build size + sim regression)
 
 ## P5 — Sim-developable features
@@ -92,16 +113,80 @@ reverted-then-re-added bits). Safety net = `sim` + build.
 - [ ] Trajectory overlay: actual path vs planned path vs wall detections on the maze view
 - [ ] Compare-two-runs / parameter-sweep view (decel, brake_rev, VPROF_DECEL_FRAC, …)
 
-## P7 — OTA firmware update (STM32 via ESP32-C3)  *(agreed worth doing; do AFTER P3)*
-Goal: flash the STM32 over the existing WiFi link instead of SWD. **Stage the image
-in the board's EXTERNAL flash** (not yet configured). Full design + rationale in
-memory `ota-external-flash-plan.md`.
-- [ ] Fix the latent linker risk first: cap `STM32G474RETX_FLASH.ld` app region so it
-      can't grow into the top 3 persistent pages (maze/cal/settings @ 0x0807D000+)
-- [ ] `git init` the firmware repo (no safety net today) BEFORE any .ioc regen
-- [ ] Configure external flash in `NEMSIS.ioc` (SPI/QSPI) — **⚠️ regen wipes main.c
-      SPI1/SPI3/HSE fixes: back up Core/ + re-apply per the checklist in the memory**
-- [ ] Minimal STM32 bootloader (bottom of flash, never OTA'd): entry via RTC-backup
+## P7 — OTA firmware update (STM32 via ESP32-C3)  ✅ **FUNCTIONALLY COMPLETE 2026-07-07**
+Goal: flash the STM32 over the existing WiFi link instead of SWD. DONE — full flow
+works (Build & push → stage → CRC verify → apply → bootloader installs → boots), with
+LED feedback, golden rollback, and a power-loss-safe boot-time CRC gate. Everyday use +
+recovery in `docs/OTA.md`; full design + rationale in memory `ota-external-flash-plan.md`.
+
+**⏸ PARKED FOR LATER (OTA is usable without these):**
+- [ ] Run the collaborative auto-rescue demo: populate golden (`ota golden`), then
+      `tools/corrupt_app.jlink` → confirm the bootloader auto-restores golden.
+- [ ] B3.3 boot-confirm trial counter — protects against a CRC-valid image that
+      *crashes at runtime* (app confirms healthy; N unconfirmed boots → golden).
+- [x] Fix the latent linker risk first: cap the app region so it can't grow into the
+      top 3 persistent pages (maze/cal/settings @ 0x0807D000+) *(2026-07-07: KEY FINDING
+      — PlatformIO ignores `STM32CubeIDE/*.ld`; it uses the package script from
+      `tool-ldscripts-ststm32/stm32g4/STM32G474RETX_FLASH.ld`. Fix: copied that script
+      into repo `linker/STM32G474RETX_FLASH.ld`, capped FLASH 512K→500K, pointed
+      `board_build.ldscript` at it in platformio.ini. Build-verified: links clean
+      (Flash 21.7%), verbose link shows `-T linker/STM32G474RETX_FLASH.ld`.)*
+- [x] `git init` the firmware repo — already under git (branch `main`)
+- [x] Configure external flash in `NEMSIS.ioc` (QSPI) *(2026-07-07: QUADSPI1 bank1
+      quad lines, W25Q32JW 4MB, pins PA6/7 PB0/1/10/11. Regen wiped the ADC1/ADC4
+      hardware oversampler — restored. `30afd61`)* + **driver + bus PROVEN**
+      *(`lib/qspiflash` + `qspi` cmd; bench over WiFi: id=EF/60/16, `qspi test`
+      round-trip PASS. `42b86f5`)*
+- [x] **Tier A — transport + QSPI staging (2026-07-07, bench-PROVEN over WiFi):**
+      app "Update firmware…" streams a .bin → `lib/ota` stages it in the QSPI
+      incoming slot → read-back CRC verify. base64 (dodges the ESP `##..##` magic)
+      + per-chunk ACK gate (covers the 256→1024 RX ring + on-the-fly sector
+      erase). `otarx`/`ota` cmds; `ota_upload.py` + `connection.py` sniffer.
+      Proven: 119672 B staged, `OTARX,DONE,OK crc=1C3730F4`, `ota verify` OK.
+      **Cannot brick — no jump.** NEXT = Tier B bootloader.
+- [x] **Tier B / B1 — app relocation + jump-only bootloader (2026-07-07, HW-PROVEN):**
+      app moved to 0x08008000 (env:app_ota, linker/app_reloc.ld, explicit
+      `SCB->VTOR=APP_VTOR_BASE` in main.c USER CODE); 32KB bootloader at
+      0x08000000 (`bootloader/` standalone project) validates the app vector +
+      jumps. Original 0x08000000 build kept intact as recovery (default_envs).
+      Flash both in ONE J-Link session (`tools/flash_ota.jlink`) — separate
+      pio uploads mass-erase each other. **BUG found+fixed:** bootloader must
+      `__enable_irq()` before the jump or the app inherits PRIMASK=1, SysTick
+      never fires, every HAL_Delay hangs (app runs but looks dead — diagnosed
+      via J-Link: PC stuck in HAL_GetTick). After fix: full menu/sensors work.
+- [x] **B2 — the installer (2026-07-07, HW-PROVEN via J-Link): OTA FUNCTIONALLY
+      COMPLETE.** `ota apply` verifies the staged image, sets TAMP BKP0R apply
+      flag, resets. Bootloader (now brings up HSI+QSPI+FLASH): if flag set +
+      QSPI image CRC-valid → erase app slot → copy QSPI→0x08008000 (doubleword
+      program) → verify → clear flag → jump. **BUG found+fixed:** bootloader
+      needs its own `SysTick_Handler`→HAL_IncTick (HAL_Init enables SysTick; a
+      HAL_QSPI/FLASH timeout loop can't expire without a ticking uwTick → the
+      apply path hung with RED LEDs; normal boot was fine since it does no HAL
+      waits). After fix: full apply verified (set BKP0R via `tools/set_apply.jlink`
+      → app boots from the freshly-copied slot, PC free-running). App-side file
+      dialog defaults to app_ota build (the only OTA-installable image).
+- [x] **B3.1 — golden image + manual rollback (2026-07-07, bootloader paths
+      HW-verified):** `ota golden` promotes the staged (==running) image to the
+      QSPI golden slot (QSPI→QSPI copy, CRC-verified); `ota rollback` resets into
+      the bootloader which copies golden→app slot. Bootloader also auto-restores
+      golden if an apply copy fails midway. App: "Recovery ▾" menu (Save as
+      golden / Roll back). Verified via J-Link: normal boot ✓, apply-from-incoming
+      still ✓ (B2 regression), rollback with empty golden = safe no-op ✓ (never
+      strands). Full golden→rollback round-trip = user bench test.
+- [x] **B3.2 — automatic boot-time CRC gate (2026-07-07, regression HW-verified):**
+      bootloader writes current-app meta (size+crc @ QSPI 0x0E0000) on every
+      successful install/rollback; on EVERY boot `validate_and_recover()` CRCs
+      the app slot vs current-meta and auto-restores golden on mismatch — closes
+      the power-loss-during-copy window (backup-reg apply flag is lost on power
+      loss, but current-meta is in non-volatile QSPI). Added QSPI write path to
+      the bootloader (5.2KB). `ota info` shows golden/current state. Verified via
+      J-Link: normal boot ✓, apply writes current-meta + gate passes good app ✓
+      (no false-positive/hang). Full auto-rescue = collaborative test
+      (`tools/corrupt_app.jlink` after golden populated).
+- [ ] B3.3 (optional): boot-confirm trial counter for a complete-but-CRC-valid
+      image that crashes at runtime (app confirms healthy; N unconfirmed boots →
+      restore golden). Different failure mode than B3.2's corruption gate.
+- [ ] (was) B2 bootloader (bottom of flash, never OTA'd): entry via RTC-backup
       flag + reset; receive image over PC4/PC5; CRC-verify in external flash; copy to
       internal app slot; jump. Keep a golden image in external flash for rollback
 - [ ] Move app start + set VTOR; ESP-side flashing protocol (reuse chunked transfer);

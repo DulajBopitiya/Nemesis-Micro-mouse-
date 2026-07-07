@@ -71,8 +71,11 @@ TURN_DONE_RX = re.compile(r"TURN:\s*done,\s*heading\s*(-?\d+)\s*deg", re.I)
 TURNDIAG_RX = re.compile(
     r"TURNDIAG,\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)"
     r"(?:,\s*(-?\d+),\s*(-?\d+))?")
-# "TURNSUM,turns,cum_resid_ddeg,mean_resid_ddeg" - benchturn summary (cum=total drift)
-TURNSUM_RX = re.compile(r"TURNSUM,\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)")
+# "TURNSUM,turns,cum_resid_ddeg,mean_resid_ddeg[,drift_ddeg]" - benchturn summary.
+# cum_resid = sum of per-turn in-frame shortfalls (hcarry-invariant); drift (optional,
+# newer firmware) = true accumulated heading - ideal = the REAL error carried out of the
+# sequence, which is what the hcarry fix drives toward ~0.
+TURNSUM_RX = re.compile(r"TURNSUM,\s*(-?\d+),\s*(-?\d+),\s*(-?\d+)(?:,\s*(-?\d+))?")
 
 IR_NAMES   = ["L_LM", "L_M", "L_F", "R_F", "R_M", "R_RM"]
 
@@ -199,7 +202,10 @@ def parse_event(line: str) -> Tuple[Optional[str], Optional[dict]]:
         return "turndiag", d
     m = TURNSUM_RX.search(line)
     if m:
-        return "turnsum", {"turns": int(m.group(1)),
-                           "cum_residual_deg": int(m.group(2)) / 10.0,
-                           "mean_residual_deg": int(m.group(3)) / 10.0}
+        d = {"turns": int(m.group(1)),
+             "cum_residual_deg": int(m.group(2)) / 10.0,
+             "mean_residual_deg": int(m.group(3)) / 10.0}
+        if m.group(4) is not None:
+            d["drift_deg"] = int(m.group(4)) / 10.0
+        return "turnsum", d
     return None, None

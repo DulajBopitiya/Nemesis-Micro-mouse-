@@ -58,6 +58,8 @@ ADC_HandleTypeDef hadc4;
 
 I2C_HandleTypeDef hi2c3;
 
+QSPI_HandleTypeDef hqspi1;
+
 SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi3;
 
@@ -89,6 +91,7 @@ static void MX_ADC1_Init(void);
 static void MX_TIM8_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_QUADSPI1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -184,6 +187,14 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+#ifdef APP_VTOR_BASE
+  /* OTA-relocated build (env:app_ota): the app lives at 0x08008000, reached via
+     the bootloader. Point the vector table at the app base HERE, before HAL_Init
+     enables SysTick or any IRQ - unambiguous and independent of the framework's
+     fragile VECT_TAB_OFFSET macro. (The bootloader also sets VTOR before the
+     jump; this makes the app self-correct regardless of how it was entered.) */
+  SCB->VTOR = (uint32_t)(APP_VTOR_BASE);
+#endif
   uint32_t last_led = 0;     /* heartbeat LED scheduler */
   uint8_t  led_step = 0;
   uint32_t last_sens = 0;    /* IR sensor sweep scheduler (~100 Hz) */
@@ -219,6 +230,7 @@ int main(void)
   MX_TIM8_Init();
   MX_USART1_UART_Init();
   MX_TIM3_Init();
+  MX_QUADSPI1_Init();
   /* USER CODE BEGIN 2 */
   DBG_Init();
   LOG("\r\n=== Nemisis boot ===\r\n");
@@ -364,6 +376,7 @@ int main(void)
     .htim_encL = &htim1,
     .htim_encR = &htim2,
     .huart     = &huart1,
+    .hqspi     = &hqspi1,
   };
   Console_Init(&con);
 
@@ -691,6 +704,41 @@ static void MX_I2C3_Init(void)
   /* USER CODE BEGIN I2C3_Init 2 */
 
   /* USER CODE END I2C3_Init 2 */
+
+}
+
+/**
+  * @brief QUADSPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_QUADSPI1_Init(void)
+{
+
+  /* USER CODE BEGIN QUADSPI1_Init 0 */
+
+  /* USER CODE END QUADSPI1_Init 0 */
+
+  /* USER CODE BEGIN QUADSPI1_Init 1 */
+
+  /* USER CODE END QUADSPI1_Init 1 */
+  /* QUADSPI1 parameter configuration*/
+  hqspi1.Instance = QUADSPI;
+  hqspi1.Init.ClockPrescaler = 3;
+  hqspi1.Init.FifoThreshold = 4;
+  hqspi1.Init.SampleShifting = QSPI_SAMPLE_SHIFTING_NONE;
+  hqspi1.Init.FlashSize = 21;
+  hqspi1.Init.ChipSelectHighTime = QSPI_CS_HIGH_TIME_6_CYCLE;
+  hqspi1.Init.ClockMode = QSPI_CLOCK_MODE_0;
+  hqspi1.Init.FlashID = QSPI_FLASH_ID_1;
+  hqspi1.Init.DualFlash = QSPI_DUALFLASH_DISABLE;
+  if (HAL_QSPI_Init(&hqspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN QUADSPI1_Init 2 */
+
+  /* USER CODE END QUADSPI1_Init 2 */
 
 }
 
