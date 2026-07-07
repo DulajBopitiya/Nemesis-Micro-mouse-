@@ -116,7 +116,17 @@ memory `ota-external-flash-plan.md`.
       erase). `otarx`/`ota` cmds; `ota_upload.py` + `connection.py` sniffer.
       Proven: 119672 B staged, `OTARX,DONE,OK crc=1C3730F4`, `ota verify` OK.
       **Cannot brick — no jump.** NEXT = Tier B bootloader.
-- [ ] Minimal STM32 bootloader (bottom of flash, never OTA'd): entry via RTC-backup
+- [x] **Tier B / B1 — app relocation + jump-only bootloader (2026-07-07, HW-PROVEN):**
+      app moved to 0x08008000 (env:app_ota, linker/app_reloc.ld, explicit
+      `SCB->VTOR=APP_VTOR_BASE` in main.c USER CODE); 32KB bootloader at
+      0x08000000 (`bootloader/` standalone project) validates the app vector +
+      jumps. Original 0x08000000 build kept intact as recovery (default_envs).
+      Flash both in ONE J-Link session (`tools/flash_ota.jlink`) — separate
+      pio uploads mass-erase each other. **BUG found+fixed:** bootloader must
+      `__enable_irq()` before the jump or the app inherits PRIMASK=1, SysTick
+      never fires, every HAL_Delay hangs (app runs but looks dead — diagnosed
+      via J-Link: PC stuck in HAL_GetTick). After fix: full menu/sensors work.
+- [ ] B2 bootloader (bottom of flash, never OTA'd): entry via RTC-backup
       flag + reset; receive image over PC4/PC5; CRC-verify in external flash; copy to
       internal app slot; jump. Keep a golden image in external flash for rollback
 - [ ] Move app start + set VTOR; ESP-side flashing protocol (reuse chunked transfer);

@@ -187,6 +187,14 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+#ifdef APP_VTOR_BASE
+  /* OTA-relocated build (env:app_ota): the app lives at 0x08008000, reached via
+     the bootloader. Point the vector table at the app base HERE, before HAL_Init
+     enables SysTick or any IRQ - unambiguous and independent of the framework's
+     fragile VECT_TAB_OFFSET macro. (The bootloader also sets VTOR before the
+     jump; this makes the app self-correct regardless of how it was entered.) */
+  SCB->VTOR = (uint32_t)(APP_VTOR_BASE);
+#endif
   uint32_t last_led = 0;     /* heartbeat LED scheduler */
   uint8_t  led_step = 0;
   uint32_t last_sens = 0;    /* IR sensor sweep scheduler (~100 Hz) */

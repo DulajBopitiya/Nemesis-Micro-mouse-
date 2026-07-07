@@ -1,0 +1,24 @@
+// NEMESIS OTA - flash the bootloader + relocated app in ONE J-Link session.
+//
+// Each PlatformIO `-t upload` mass-erases the chip, so flashing the two images
+// separately can never leave both present (the 2nd erase wipes the 1st). This
+// script erases ONCE, then loads both at their addresses, so they coexist.
+//
+// Run (PowerShell):
+//   & "C:\Program Files\SEGGER\JLink_V924a\JLink.exe" -CommanderScript `
+//     "C:\Users\User\Documents\FAB-VOLT\NIMISIS\NEMISIS VSCODE\Nemisis Firmware\tools\flash_ota.jlink"
+//
+// Recovery (back to normal firmware) is just the usual:
+//   pio run -e nucleo_g474re -t upload
+si SWD
+speed 4000
+device STM32G474RE
+connect
+r
+h
+erase
+loadbin "C:\Users\User\Documents\FAB-VOLT\NIMISIS\NEMISIS VSCODE\Nemisis Firmware\bootloader\.pio\build\boot\firmware.bin", 0x08000000
+loadbin "C:\Users\User\Documents\FAB-VOLT\NIMISIS\NEMISIS VSCODE\Nemisis Firmware\.pio\build\app_ota\firmware.bin", 0x08008000
+r
+g
+qc

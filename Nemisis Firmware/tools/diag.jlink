@@ -1,0 +1,11 @@
+si SWD
+speed 4000
+device STM32G474RE
+connect
+h
+regs
+mem32 0x08000000, 2
+mem32 0x08008000, 2
+mem32 0xE000ED08, 1
+mem32 0xE000ED2C, 1
+qc
