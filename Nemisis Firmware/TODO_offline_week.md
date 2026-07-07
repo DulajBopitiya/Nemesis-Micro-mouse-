@@ -92,10 +92,17 @@ reverted-then-re-added bits). Safety net = `sim` + build.
 - [ ] Trajectory overlay: actual path vs planned path vs wall detections on the maze view
 - [ ] Compare-two-runs / parameter-sweep view (decel, brake_rev, VPROF_DECEL_FRAC, …)
 
-## P7 — OTA firmware update (STM32 via ESP32-C3)  *(agreed worth doing; do AFTER P3)*
-Goal: flash the STM32 over the existing WiFi link instead of SWD. **Stage the image
-in the board's EXTERNAL flash** (not yet configured). Full design + rationale in
-memory `ota-external-flash-plan.md`.
+## P7 — OTA firmware update (STM32 via ESP32-C3)  ✅ **FUNCTIONALLY COMPLETE 2026-07-07**
+Goal: flash the STM32 over the existing WiFi link instead of SWD. DONE — full flow
+works (Build & push → stage → CRC verify → apply → bootloader installs → boots), with
+LED feedback, golden rollback, and a power-loss-safe boot-time CRC gate. Everyday use +
+recovery in `docs/OTA.md`; full design + rationale in memory `ota-external-flash-plan.md`.
+
+**⏸ PARKED FOR LATER (OTA is usable without these):**
+- [ ] Run the collaborative auto-rescue demo: populate golden (`ota golden`), then
+      `tools/corrupt_app.jlink` → confirm the bootloader auto-restores golden.
+- [ ] B3.3 boot-confirm trial counter — protects against a CRC-valid image that
+      *crashes at runtime* (app confirms healthy; N unconfirmed boots → golden).
 - [x] Fix the latent linker risk first: cap the app region so it can't grow into the
       top 3 persistent pages (maze/cal/settings @ 0x0807D000+) *(2026-07-07: KEY FINDING
       — PlatformIO ignores `STM32CubeIDE/*.ld`; it uses the package script from
