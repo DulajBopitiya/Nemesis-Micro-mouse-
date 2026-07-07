@@ -33,6 +33,7 @@
 #define OTA_META_MAGIC      0x4F544131u
 #define OTA_STATUS_VALID    0xA5A5A5A5u
 #define OTA_APPLY_MAGIC     0x0A7A0A7Au
+#define OTA_APPLIED_MAGIC   0x0A9911EDu     /* -> app flashes green on next boot */
 
 typedef struct { uint32_t magic, size, crc32, status; } OtaMeta;
 
@@ -224,6 +225,10 @@ static void maybe_apply_update(void)
   /* Verify what actually landed in the app slot (memory-mapped read). If this
      fails the slot is bad, but we've done all we can here - B3 adds rollback. */
   if (crc32(0, (const uint8_t *)APP_BASE, m.size) != m.crc32) goto done;
+
+  /* Install succeeded - tell the app to flash green on this boot. (Backup-domain
+     write access was enabled in main() via bkp_access_enable().) */
+  TAMP->BKP1R = OTA_APPLIED_MAGIC;
 
 done:
   HAL_QSPI_DeInit(&hqspi1);

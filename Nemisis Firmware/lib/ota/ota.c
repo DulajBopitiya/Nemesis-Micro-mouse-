@@ -141,6 +141,16 @@ void Ota_RequestApply(void)
   TAMP->BKP0R = OTA_APPLY_MAGIC;
 }
 
+bool Ota_JustApplied(void)
+{
+  __HAL_RCC_PWR_CLK_ENABLE();
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_RTCAPB_CLK_ENABLE();
+  if (TAMP->BKP1R != OTA_APPLIED_MAGIC) return false;
+  TAMP->BKP1R = 0;                       /* one-shot: clear so it only fires once */
+  return true;
+}
+
 bool Ota_VerifyIncoming(void)
 {
   OtaMeta m;

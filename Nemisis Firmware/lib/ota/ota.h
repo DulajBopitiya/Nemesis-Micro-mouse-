@@ -41,6 +41,12 @@
    MUST be kept in sync with the copy in bootloader/src/main.c. */
 #define OTA_APPLY_MAGIC      0x0A7A0A7Au
 
+/* "An update was just installed" handshake, the other direction: the bootloader
+   writes OTA_APPLIED_MAGIC to TAMP backup register 1 right after a successful
+   copy, and the app reads+clears it on boot to flash the LEDs green. MUST match
+   the copy in bootloader/src/main.c. */
+#define OTA_APPLIED_MAGIC    0x0A9911EDu
+
 /* Metadata record stored (erased-then-written) in a dedicated QSPI sector. */
 typedef struct
 {
@@ -83,5 +89,9 @@ bool Ota_VerifyIncoming(void);
  *  resets (NVIC_SystemReset) so the bootloader copies the staged image into the
  *  app slot. Does NOT itself reset. Only call after Ota_VerifyIncoming(). */
 void Ota_RequestApply(void);
+
+/** Returns true exactly once after the bootloader installed an update this boot
+ *  (reads and clears TAMP backup reg 1). Use it to show a boot confirmation. */
+bool Ota_JustApplied(void);
 
 #endif /* OTA_H */

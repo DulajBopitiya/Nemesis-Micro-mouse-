@@ -1874,11 +1874,18 @@ class MainWindow(QtWidgets.QMainWindow):
             prog.close()
             if ok:
                 self._log("[ota] firmware staged + verified in QSPI ✓")
-                QtWidgets.QMessageBox.information(
-                    self, "Update firmware",
-                    "Image staged and CRC-verified in external flash.\n\n"
-                    "(Tier A: staging only — the bootloader that copies it into "
-                    "the app slot is the next step.)")
+                choice = QtWidgets.QMessageBox.question(
+                    self, "Install firmware?",
+                    "Image staged and CRC-verified in external flash "
+                    "(LEDs went green on the mouse).\n\n"
+                    "Install it now? The mouse will reset into the bootloader, "
+                    "copy the new firmware into place (a few seconds), and reboot. "
+                    "The link will drop briefly and reconnect.",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.Yes)
+                if choice == QtWidgets.QMessageBox.Yes:
+                    self._log("[ota] applying update — mouse resetting into bootloader…")
+                    self._send("ota apply")
             else:
                 QtWidgets.QMessageBox.warning(
                     self, "Update firmware", f"Staging failed:\n\n{err}")

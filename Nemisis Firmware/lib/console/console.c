@@ -20,6 +20,7 @@
 #include "mazestore.h"
 #include "qspiflash.h"
 #include "ota.h"
+#include "ws2812.h"       /* 4 RGB LEDs = OTA transfer/verify indicator */
 
 #include <string.h>
 #include <stdarg.h>
@@ -2291,6 +2292,32 @@ static int ota_read_line(char *buf, int max, uint32_t timeout_ms)
   }
 }
 
+/* OTA progress/result on the 4 RGB LEDs. During receive they fill blue as bytes
+   arrive (each LED ~= 25% of the image); solid green when the image verifies,
+   solid red on any failure. The main loop's heartbeat reclaims the LEDs about a
+   second after cmd_otarx returns, so failure/success is held briefly to be seen.
+   Safe here because the whole transfer runs inside this (blocking) command, so
+   nothing else drives the LED chain meanwhile. */
+static void ota_leds(uint32_t lit, uint8_t r, uint8_t g, uint8_t b)
+{
+  if (lit > WS2812_NUM_LEDS) lit = WS2812_NUM_LEDS;
+  for (uint32_t i = 0; i < WS2812_NUM_LEDS; i++)
+  {
+    if (i < lit) WS2812_SetPixel((uint16_t)i, r, g, b);
+    else         WS2812_SetPixel((uint16_t)i, 0, 0, 0);
+  }
+  WS2812_Show();
+}
+
+/* Flag a failed transfer: red LEDs held briefly, invalidate the slot, done. */
+static void ota_fail(const char *msg)
+{
+  puts_(msg);
+  Ota_FinishStage(0xFFFFFFFFu, NULL, NULL);   /* writes INVALID metadata */
+  ota_leds(WS2812_NUM_LEDS, 24, 0, 0);        /* all red */
+  HAL_Delay(1200);
+}
+
 static void cmd_otarx(int argc, char **argv)
 {
   if (argc < 3)
@@ -2305,37 +2332,53 @@ static void cmd_otarx(int argc, char **argv)
   {
     cprintf("OTARX,ERR,begin (size=%lu max=%lu)\r\n",
             (unsigned long)size, (unsigned long)OTA_IMAGE_MAX);
+    ota_leds(WS2812_NUM_LEDS, 24, 0, 0);
+    HAL_Delay(1200);
     return;
   }
   cprintf("OTARX,READY,%d\r\n", OTA_CHUNK_MAX);
+  ota_leds(0, 0, 0, 0);                      /* clear: transfer starting */
 
   static char    lb[OTA_LINE_MAX];
   static uint8_t db[OTA_CHUNK_MAX];
   uint32_t total = 0;
+  uint32_t last_lit = 0;
 
   while (total < size)
   {
     int ln = ota_read_line(lb, sizeof lb, OTA_RX_TMO_MS);
-    if (ln < 0)      { puts_("OTARX,ERR,timeout\r\n"); Ota_FinishStage(0xFFFFFFFFu, NULL, NULL); return; }
+    if (ln < 0)      { ota_fail("OTARX,ERR,timeout\r\n"); return; }
     if (ln == 0)     { continue; }                         /* stray blank line */
-    if (ci_eq(lb, "OTAABORT")) { puts_("OTARX,ERR,abort\r\n"); Ota_FinishStage(0xFFFFFFFFu, NULL, NULL); return; }
+    if (ci_eq(lb, "OTAABORT")) { ota_fail("OTARX,ERR,abort\r\n"); return; }
     if (ci_eq(lb, "OTAEND"))   { break; }
 
     int nb = b64_decode(lb, ln, db, sizeof db);
-    if (nb <= 0)              { puts_("OTARX,NAK,decode\r\n"); Ota_FinishStage(0xFFFFFFFFu, NULL, NULL); return; }
-    if (!Ota_WriteChunk(db, (size_t)nb)) { puts_("OTARX,NAK,write\r\n"); Ota_FinishStage(0xFFFFFFFFu, NULL, NULL); return; }
+    if (nb <= 0)              { ota_fail("OTARX,NAK,decode\r\n"); return; }
+    if (!Ota_WriteChunk(db, (size_t)nb)) { ota_fail("OTARX,NAK,write\r\n"); return; }
 
     total += (uint32_t)nb;
     cprintf("OTARX,ACK,%lu\r\n", (unsigned long)total);    /* paces the sender */
+
+    /* Blue progress bar - only redraw when a whole LED's worth (~25%) fills. */
+    uint32_t lit = (uint32_t)((uint64_t)total * WS2812_NUM_LEDS / size);
+    if (lit != last_lit) { last_lit = lit; ota_leds(lit, 0, 0, 22); }
   }
 
   uint32_t got = 0, rx = 0;
   bool ok = Ota_FinishStage(crc, &got, &rx);
   if (ok)
+  {
     cprintf("OTARX,DONE,OK,crc=%08lX,rx=%lu\r\n", (unsigned long)got, (unsigned long)rx);
+    ota_leds(WS2812_NUM_LEDS, 0, 24, 0);      /* all green: staged + verified */
+    HAL_Delay(1500);
+  }
   else
+  {
     cprintf("OTARX,DONE,CRCFAIL,got=%08lX,want=%08lX,rx=%lu\r\n",
             (unsigned long)got, (unsigned long)crc, (unsigned long)rx);
+    ota_leds(WS2812_NUM_LEDS, 24, 0, 0);      /* all red: verify failed */
+    HAL_Delay(1500);
+  }
 }
 
 /* Inspect / verify the staged incoming image (independent of the receiver).
@@ -2753,6 +2796,16 @@ void Console_Init(const ConsoleCtx *ctx)
   qspi_ok = QSpiFlash_Init(C->hqspi);
   cprintf("QSPI flash (OTA staging): %s\r\n",
           qspi_ok ? "W25Q32JW OK" : "NOT DETECTED (run 'qspi id')");
+
+  /* First boot after the bootloader installed an OTA update: confirm with a
+     green LED flash so it's obvious the new firmware is live. */
+  if (Ota_JustApplied())
+  {
+    puts_("OTA: update installed and running\r\n");
+    ota_leds(WS2812_NUM_LEDS, 0, 30, 0);    /* solid green */
+    HAL_Delay(1200);
+    ota_leds(0, 0, 0, 0);                    /* back to normal; heartbeat resumes */
+  }
 
   print_menu();
 }
