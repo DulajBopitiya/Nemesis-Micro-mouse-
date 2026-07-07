@@ -30,6 +30,11 @@ class NemisisLink:
         self._rx_thread: Optional[threading.Thread] = None
         self._running = False
         self._on_line: Optional[Callable[[str], None]] = None
+        # Optional additive tap on every received line, used by bulk/synchronous
+        # flows (e.g. OTA firmware upload) that need to await specific replies
+        # without disturbing the normal GUI line callback. Called on the rx
+        # thread, in addition to (before) _on_line.
+        self._sniffer: Optional[Callable[[str], None]] = None
 
     # -- lifecycle ---------------------------------------------------------
     def connect(self) -> None:
@@ -70,6 +75,12 @@ class NemisisLink:
         """Register a callback invoked once per received text line."""
         self._on_line = callback
 
+    def set_sniffer(self, callback: Optional[Callable[[str], None]]) -> None:
+        """Install (or clear, with None) an additive per-line tap. Runs on the
+        rx thread alongside the main on_line callback - keep it fast and
+        non-blocking (e.g. push to a queue)."""
+        self._sniffer = callback
+
     def send_line(self, text: str) -> None:
         """Send one command. A trailing CR is added (the console terminates on
         CR or LF) so it works identically to typing in RTT."""
@@ -95,6 +106,11 @@ class NemisisLink:
             while b"\n" in buf:
                 raw, buf = buf.split(b"\n", 1)
                 line = raw.decode("utf-8", errors="replace")
+                if self._sniffer:
+                    try:
+                        self._sniffer(line)
+                    except Exception:       # a bad tap must never kill the rx loop
+                        pass
                 if self._on_line:
                     self._on_line(line)
         self._running = False

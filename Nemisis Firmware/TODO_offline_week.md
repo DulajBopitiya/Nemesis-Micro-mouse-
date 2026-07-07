@@ -104,8 +104,18 @@ memory `ota-external-flash-plan.md`.
       `board_build.ldscript` at it in platformio.ini. Build-verified: links clean
       (Flash 21.7%), verbose link shows `-T linker/STM32G474RETX_FLASH.ld`.)*
 - [x] `git init` the firmware repo — already under git (branch `main`)
-- [ ] Configure external flash in `NEMSIS.ioc` (SPI/QSPI) — **⚠️ regen wipes main.c
-      SPI1/SPI3/HSE fixes: back up Core/ + re-apply per the checklist in the memory**
+- [x] Configure external flash in `NEMSIS.ioc` (QSPI) *(2026-07-07: QUADSPI1 bank1
+      quad lines, W25Q32JW 4MB, pins PA6/7 PB0/1/10/11. Regen wiped the ADC1/ADC4
+      hardware oversampler — restored. `30afd61`)* + **driver + bus PROVEN**
+      *(`lib/qspiflash` + `qspi` cmd; bench over WiFi: id=EF/60/16, `qspi test`
+      round-trip PASS. `42b86f5`)*
+- [x] **Tier A — transport + QSPI staging (2026-07-07, bench-PROVEN over WiFi):**
+      app "Update firmware…" streams a .bin → `lib/ota` stages it in the QSPI
+      incoming slot → read-back CRC verify. base64 (dodges the ESP `##..##` magic)
+      + per-chunk ACK gate (covers the 256→1024 RX ring + on-the-fly sector
+      erase). `otarx`/`ota` cmds; `ota_upload.py` + `connection.py` sniffer.
+      Proven: 119672 B staged, `OTARX,DONE,OK crc=1C3730F4`, `ota verify` OK.
+      **Cannot brick — no jump.** NEXT = Tier B bootloader.
 - [ ] Minimal STM32 bootloader (bottom of flash, never OTA'd): entry via RTC-backup
       flag + reset; receive image over PC4/PC5; CRC-verify in external flash; copy to
       internal app slot; jump. Keep a golden image in external flash for rollback

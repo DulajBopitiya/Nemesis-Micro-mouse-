@@ -19,6 +19,7 @@
 #include "solver.h"
 #include "mazestore.h"
 #include "qspiflash.h"
+#include "ota.h"
 
 #include <string.h>
 #include <stdarg.h>
@@ -54,7 +55,7 @@ static int     last_term;            /* to swallow the LF in a CR/LF pair */
    received byte is lost. The handler is USART1_IRQHandler (this board's bridge
    UART is USART1); it overrides the weak default in the startup file. */
 #define TXR_SZ 2048U                 /* power-of-two not required, plain modulo */
-#define RXR_SZ 256U
+#define RXR_SZ 1024U                 /* headroom for OTA receive bursts (was 256) */
 static volatile uint8_t  txr[TXR_SZ];
 static volatile uint16_t txr_head, txr_tail;
 static volatile uint8_t  rxr[RXR_SZ];
@@ -2219,6 +2220,149 @@ static void cmd_qspi(int argc, char **argv)
   }
 }
 
+/* ---- OTA firmware receive (Tier A: stage into QSPI, no jump) --------------
+   Protocol (base64 payload so it can never contain the ESP bridge's '##...##'
+   magic; ACK-gated so the 256->1024 B RX ring + ~400 ms sector erase can't
+   overrun the transfer):
+     app -> otarx <size> <crc32hex>
+     mcu -> OTARX,READY,<maxchunk>        (or OTARX,ERR,...)
+     app -> <base64 line>   (payload <= OTA_CHUNK_MAX bytes decoded)
+     mcu -> OTARX,ACK,<total>             (per line; NAK/ERR on failure)
+     ...repeat until <total> == size...
+     app -> OTAEND                        (optional; mcu also finishes on size)
+     mcu -> OTARX,DONE,OK,crc=...,rx=...   | OTARX,DONE,CRCFAIL,got=...,want=...
+   Blocking foreground op (motors idle); the 1 kHz control + UART RX ISRs keep
+   running, so timing/telemetry are unaffected. */
+#define OTA_CHUNK_MAX  384           /* multiple of 3 -> base64 = 512 chars, no '=' */
+#define OTA_LINE_MAX   544           /* >= 512 base64 chars + NUL + slack           */
+#define OTA_RX_TMO_MS  8000u
+
+static int b64_val(int c)
+{
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+/* Decode base64 `src` (len chars) into `dst`. Returns byte count, or -1 on a
+   bad character / overflow. '=' padding and trailing NUL end the input. */
+static int b64_decode(const char *src, int len, uint8_t *dst, int dstmax)
+{
+  int out = 0, bits = 0, acc = 0;
+  for (int i = 0; i < len; i++)
+  {
+    int c = src[i];
+    if (c == '=' || c == '\0') break;
+    int v = b64_val(c);
+    if (v < 0) return -1;
+    acc = (acc << 6) | v;
+    bits += 6;
+    if (bits >= 8)
+    {
+      bits -= 8;
+      if (out >= dstmax) return -1;
+      dst[out++] = (uint8_t)((acc >> bits) & 0xFF);
+    }
+  }
+  return out;
+}
+
+/* Read one line (bytes until '\n', '\r' ignored) via read_byte() with an
+   inter-byte timeout. Returns length, or -1 on timeout. No echo (OTA is bulk).*/
+static int ota_read_line(char *buf, int max, uint32_t timeout_ms)
+{
+  int n = 0;
+  uint32_t last = HAL_GetTick();
+  for (;;)
+  {
+    int c = read_byte();
+    if (c < 0)
+    {
+      if ((HAL_GetTick() - last) > timeout_ms) return -1;
+      continue;
+    }
+    last = HAL_GetTick();
+    if (c == '\n' || c == '\r') { buf[n] = '\0'; return n; } /* CR or LF ends it */
+    if (n < max - 1) buf[n++] = (char)c;
+    /* overflow: keep consuming to the terminator; decode will reject it */
+  }
+}
+
+static void cmd_otarx(int argc, char **argv)
+{
+  if (argc < 3)
+  {
+    puts_("usage: otarx <size> <crc32hex>\r\n");
+    return;
+  }
+  uint32_t size = (uint32_t)strtoul(argv[1], NULL, 10);
+  uint32_t crc  = (uint32_t)strtoul(argv[2], NULL, 16);
+
+  if (!Ota_BeginStage(size))
+  {
+    cprintf("OTARX,ERR,begin (size=%lu max=%lu)\r\n",
+            (unsigned long)size, (unsigned long)OTA_IMAGE_MAX);
+    return;
+  }
+  cprintf("OTARX,READY,%d\r\n", OTA_CHUNK_MAX);
+
+  static char    lb[OTA_LINE_MAX];
+  static uint8_t db[OTA_CHUNK_MAX];
+  uint32_t total = 0;
+
+  while (total < size)
+  {
+    int ln = ota_read_line(lb, sizeof lb, OTA_RX_TMO_MS);
+    if (ln < 0)      { puts_("OTARX,ERR,timeout\r\n"); Ota_FinishStage(0xFFFFFFFFu, NULL, NULL); return; }
+    if (ln == 0)     { continue; }                         /* stray blank line */
+    if (ci_eq(lb, "OTAABORT")) { puts_("OTARX,ERR,abort\r\n"); Ota_FinishStage(0xFFFFFFFFu, NULL, NULL); return; }
+    if (ci_eq(lb, "OTAEND"))   { break; }
+
+    int nb = b64_decode(lb, ln, db, sizeof db);
+    if (nb <= 0)              { puts_("OTARX,NAK,decode\r\n"); Ota_FinishStage(0xFFFFFFFFu, NULL, NULL); return; }
+    if (!Ota_WriteChunk(db, (size_t)nb)) { puts_("OTARX,NAK,write\r\n"); Ota_FinishStage(0xFFFFFFFFu, NULL, NULL); return; }
+
+    total += (uint32_t)nb;
+    cprintf("OTARX,ACK,%lu\r\n", (unsigned long)total);    /* paces the sender */
+  }
+
+  uint32_t got = 0, rx = 0;
+  bool ok = Ota_FinishStage(crc, &got, &rx);
+  if (ok)
+    cprintf("OTARX,DONE,OK,crc=%08lX,rx=%lu\r\n", (unsigned long)got, (unsigned long)rx);
+  else
+    cprintf("OTARX,DONE,CRCFAIL,got=%08lX,want=%08lX,rx=%lu\r\n",
+            (unsigned long)got, (unsigned long)crc, (unsigned long)rx);
+}
+
+/* Inspect / verify the staged incoming image (independent of the receiver).
+     ota info    - print the stored metadata (size/crc/status)
+     ota verify  - re-CRC the slot from QSPI and check against its metadata */
+static void cmd_ota(int argc, char **argv)
+{
+  const char *sub = (argc >= 2) ? argv[1] : "info";
+
+  if (ci_eq(sub, "info"))
+  {
+    OtaMeta m;
+    if (!Ota_ReadMeta(&m)) { puts_("ota: meta read FAILED\r\n"); return; }
+    cprintf("OTA incoming: magic=%08lX size=%lu crc=%08lX status=%s\r\n",
+            (unsigned long)m.magic, (unsigned long)m.size, (unsigned long)m.crc32,
+            (m.status == OTA_STATUS_VALID) ? "VALID" : "INVALID");
+  }
+  else if (ci_eq(sub, "verify"))
+  {
+    cprintf("OTA incoming: %s\r\n", Ota_VerifyIncoming() ? "VERIFIED (crc ok)" : "INVALID");
+  }
+  else
+  {
+    puts_("usage: ota [info|verify]\r\n");
+  }
+}
+
 /* ====================== dispatcher ====================================== */
 
 static void dispatch(char *s)
@@ -2415,6 +2559,14 @@ static void dispatch(char *s)
   else if (ci_eq(cmd, "qspi"))
   {
     cmd_qspi(argc, argv);
+  }
+  else if (ci_eq(cmd, "otarx"))
+  {
+    cmd_otarx(argc, argv);
+  }
+  else if (ci_eq(cmd, "ota"))
+  {
+    cmd_ota(argc, argv);
   }
   else if (ci_eq(cmd, "sim"))
   {

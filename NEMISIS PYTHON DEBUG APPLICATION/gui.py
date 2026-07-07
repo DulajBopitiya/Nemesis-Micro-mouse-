@@ -42,6 +42,7 @@ from recorder import Recorder
 from protocol import parse_event
 from theme import apply_theme, accent
 import serial_provision
+from ota_upload import OtaUploader
 
 # ----------------------------------------------------------------------------
 # Telemetry parsing: turn console text lines into numeric series for plotting.
@@ -563,6 +564,15 @@ class LinkBridge(QtCore.QObject):
 
 
 # ----------------------------------------------------------------------------
+# Marshal OTA worker-thread callbacks onto the Qt GUI thread (queued signals).
+# ----------------------------------------------------------------------------
+class OtaSignals(QtCore.QObject):
+    progress = Signal(int, int)     # (bytes done, total)
+    log = Signal(str)
+    done = Signal(bool, str)        # (ok, error-or-empty)
+
+
+# ----------------------------------------------------------------------------
 # Rolling data store per group/series, feeding the live plot.
 # ----------------------------------------------------------------------------
 class Series:
@@ -835,6 +845,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "Point the mouse at a different WiFi router without reflashing"
         )
         self.wifi_setup_btn.clicked.connect(self._wifi_setup_clicked)
+        self.ota_btn = QtWidgets.QPushButton("Update firmware…")
+        self.ota_btn.setToolTip(
+            "Stage a firmware .bin into the mouse's external QSPI flash over WiFi"
+        )
+        self.ota_btn.clicked.connect(self._ota_clicked)
         self.status_lbl = QtWidgets.QLabel("● disconnected")
         # persistent battery status indicator (voltage / SoC / safety state)
         self.batt_lbl = QtWidgets.QLabel("🔋 —")
@@ -845,6 +860,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.port_edit)
         bar.addWidget(self.connect_btn)
         bar.addWidget(self.wifi_setup_btn)
+        bar.addWidget(self.ota_btn)
         bar.addStretch(1)
         bar.addWidget(self.batt_lbl)
         bar.addSpacing(16)
@@ -1813,6 +1829,72 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = WifiSetupDialog(self, connected=bool(self.bridge and self.bridge.link.connected))
         dlg.portalRequested.connect(lambda: self._send("##WIFI_SETUP##"))
         dlg.exec()
+
+    def _ota_clicked(self):
+        """Stage a firmware .bin into the mouse's external QSPI flash over the
+        WiFi link (Tier A: staging + CRC verify only; nothing is flashed to the
+        running app here). See ota_upload.py and lib/ota in the firmware."""
+        if not (self.bridge and self.bridge.link.connected):
+            self._log("[not connected]")
+            return
+
+        # Default to the PlatformIO build output if it's where we expect it.
+        default_dir = ""
+        guess = (Path(__file__).resolve().parent.parent
+                 / "Nemisis Firmware" / ".pio" / "build" / "nucleo_g474re"
+                 / "firmware.bin")
+        if guess.exists():
+            default_dir = str(guess)
+
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select firmware image", default_dir,
+            "Firmware image (*.bin);;All files (*)")
+        if not path:
+            return
+
+        prog = QtWidgets.QProgressDialog("Staging firmware to QSPI…", "Cancel",
+                                         0, 100, self)
+        prog.setWindowTitle("Update firmware")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setAutoClose(False)
+        prog.setAutoReset(False)
+        prog.setValue(0)
+
+        sig = OtaSignals(self)
+
+        def _on_progress(done: int, total: int):
+            pct = int(done * 100 / total) if total else 0
+            prog.setValue(pct)
+            prog.setLabelText(f"Staging firmware to QSPI…  {done}/{total} bytes")
+
+        def _on_done(ok: bool, err: str):
+            prog.close()
+            if ok:
+                self._log("[ota] firmware staged + verified in QSPI ✓")
+                QtWidgets.QMessageBox.information(
+                    self, "Update firmware",
+                    "Image staged and CRC-verified in external flash.\n\n"
+                    "(Tier A: staging only — the bootloader that copies it into "
+                    "the app slot is the next step.)")
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "Update firmware", f"Staging failed:\n\n{err}")
+
+        sig.progress.connect(_on_progress)
+        sig.log.connect(self._log)
+        sig.done.connect(_on_done)
+
+        up = OtaUploader(
+            self.bridge.link, path,
+            on_progress=lambda d, t: sig.progress.emit(d, t),
+            on_log=lambda m: sig.log.emit(m),
+        )
+        prog.canceled.connect(up.cancel)
+        # keep refs alive for the duration of the transfer
+        self._ota_sig = sig
+        self._ota_up = up
+        up.upload_async(lambda ok, err: sig.done.emit(ok, err or ""))
 
     # -- connection --------------------------------------------------------
     def _toggle_connect(self):
