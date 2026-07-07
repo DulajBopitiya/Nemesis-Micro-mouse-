@@ -42,10 +42,15 @@ robot. `bash test/solver_sim/run_tests.sh`. See `test/solver_sim/README.md`.**
       battery sags to 6.78V (secondary). Full write-up: memory
       `drift-log-analysis-0704-0705`. Causal chain: under-rotate → skewed cell entry
       → clip/ram → desync → crash (desync = fatal, per the sim harness).
-- [ ] **Propose ONE turn-completion fix** — correct the arc/flow-turn so it rotates
-      the commanded angle (kill the ~10° debt at source), per `smooth-turn-rework-
-      analysis` (trapezoidal-ω + fix early-release + post-turn heading-setpoint
-      handoff). Needs a read of control.c turn-completion. Single, reversible change.
+- [x] **Turn-completion fix IMPLEMENTED (2026-07-07): `hcarry` heading-carry.**
+      Single, reversible change at the pinned root cause. A mid-run pivot that
+      releases short (snappy early-release/PID lag) now stashes its residual
+      (`heading_deg - head_target`); the next `Control_Start` seeds `heading_deg`
+      with it (setpoint stays 0) so that segment rotates the debt back out while
+      moving instead of banking the skew. Scoped to auto-runs (`seq_skip_gyro_cal`),
+      captured at the pivot completion (covers plain pivots + flow-turn pivot-finish),
+      cleared at `RunBegin`. Runtime toggle `hcarry on|off` (mirrors `snappy`,
+      default ON) for bench A/B. Builds clean (nucleo_g474re + app_ota, Flash 23.1%).
 - [x] **Root cause PINNED to `control.c:1753`** (2026-07-06): `Control_Start` re-zeros
       `heading_deg` every primitive → snappy pivot releases ~4° short + ~8° PID lag,
       then the next straight adopts the shortfall as "straight ahead". Fix drafted:
@@ -53,9 +58,14 @@ robot. `bash test/solver_sim/run_tests.sh`. See `test/solver_sim/README.md`.**
 - [x] **Turn-diagnostic LOGGING built + flashable** (2026-07-06): `benchturn <n> <deg>`
       spins N pivots in place (no walls) → `TURNDIAG`/`TURNSUM` lines; `turn` emits
       `TURNDIAG,-1,...`; app parses + `analyze_turns.py`. Builds clean.
-- [ ] **Bench-verify WITHOUT walls** (doable now — user has a floor): flash, run
-      `benchturn 4 90`, read the residuals to confirm the ~8° pin. THEN implement the
-      `hcarry` fix and re-run to prove cumulative drift → ~0.
+- [x] **Bench-verified the `hcarry` fix WITHOUT walls (2026-07-07, HW-PROVEN over OTA).**
+      Made `benchturn` a real run (wraps `RunBegin/RunEnd`) so the hcarry gate opens,
+      and added a TRUE-DRIFT metric to TURNSUM (accumulated heading vs ideal) since the
+      per-turn in-frame residual is hcarry-invariant and can't show the fix. A/B @ 4×90
+      in place: `hcarry off` → cum −9.1°, **drift −9.1°**; `hcarry on` → cum −9.0°
+      (per-turn shortfall unchanged), **drift −2.1°**. Cumulative drift −77%, down to one
+      turn's un-carried residual. Confirms the ~2.2°/turn under-rotate pin AND that the
+      carry cancels its accumulation. Real-run payoff (pivot→advance) still wants a maze.
 - [x] Characterise the intermittent right-wheel stall (2026-07-06, bench): added
       per-wheel posL/posR to TURNDIAG; `benchturn 6 360` → **R/L 0.99-1.04 (balanced)**,
       battery barely sagged. Right wheel is FINE on the bench → the stall is a FULL-RUN

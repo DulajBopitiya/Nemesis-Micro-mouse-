@@ -120,6 +120,14 @@ void Control_SetFrontStop(bool enable);
 void Control_SetPivotSnappy(bool on);
 bool Control_GetPivotSnappy(void);
 
+/* Heading carry (hcarry): the drift root-cause fix. A mid-run turn that releases
+ *  a few deg short of its target normally has that debt discarded (Control_Start
+ *  re-zeros the heading each primitive), so the next straight banks the skew and
+ *  the error compounds. ON (default) carries the residual into the next segment,
+ *  which rotates it back out while moving. OFF = old zero-reset (bench A/B only). */
+void Control_SetHeadingCarry(bool on);
+bool Control_GetHeadingCarry(void);
+
 /* --- Recenter (reverse a fixed distance) ----------------------------------
  * After a front-stop the mouse is jammed against the wall ahead. Backing up by
  * the distance the blocked advance travelled returns it to the cell centre, so

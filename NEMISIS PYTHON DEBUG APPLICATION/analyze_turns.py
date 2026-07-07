@@ -85,8 +85,11 @@ def main():
     worst = min(resids) if mean < 0 else max(resids)
     print(f"worst single turn {worst:+.1f}°")
     if summ:
-        print(f"firmware TURNSUM: {summ['turns']} turns, "
-              f"cum {summ['cum_residual_deg']:+.1f}°, mean {summ['mean_residual_deg']:+.1f}°")
+        line = (f"firmware TURNSUM: {summ['turns']} turns, "
+                f"cum {summ['cum_residual_deg']:+.1f}°, mean {summ['mean_residual_deg']:+.1f}°")
+        if "drift_deg" in summ:
+            line += f", true drift {summ['drift_deg']:+.1f}°  <- the hcarry metric"
+        print(line)
 
 
 if __name__ == "__main__":

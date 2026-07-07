@@ -1581,12 +1581,17 @@ static void cmd_arc(int argc, char **argv)
  *      TURNDIAG,idx,cmd_ddeg,ach_ddeg,resid_ddeg,peak_ddps,ms,reason
  *  (angles/rate x10; resid = ach-cmd, <0 = under-rotated; reason 0 clean /
  *   1 snappy early-release / 2 timeout), then at the end:
- *      TURNSUM,turns,cum_resid_ddeg,mean_resid_ddeg
- *  cum_resid is the total drift after all N turns (perfect = 0).
+ *      TURNSUM,turns,cum_resid_ddeg,mean_resid_ddeg,drift_ddeg
+ *  cum_resid = sum of per-turn in-frame shortfalls (raw under-rotate, hcarry-invariant);
+ *  drift = true accumulated heading - ideal (turns*deg) = the ACTUAL error the mouse
+ *  carries out of the sequence. hcarry ON drives drift -> ~one turn's worth even though
+ *  cum_resid is unchanged. (drift field is optional; older 3-field logs still parse.)
  * ======================================================================== */
 static bool    bench_active;
 static int     bench_remaining, bench_deg, bench_cps, bench_idx;
 static int32_t bench_cum_ddeg;
+static int32_t bench_prev_resid;   /* previous turn's in-frame residual (deci-deg)   */
+static int32_t bench_phys_ddeg;    /* true cumulative PHYSICAL rotation (deci-deg)    */
 
 static void bench_task(void)
 {
@@ -1598,6 +1603,14 @@ static void bench_task(void)
   Control_GetLastTurnDiag(&cmd, &ach, &pk, &ms, &rs, &pl, &pr);
   int32_t resid = ach - cmd;                      /* deci-deg, <0 = under-rotated  */
   bench_cum_ddeg += resid;
+  /* True PHYSICAL rotation this turn. With hcarry ON, turn k>0 is SEEDED with the
+     previous turn's residual (heading_deg starts offset by that), so it physically
+     spins the debt back out; the reported 'ach' is in that carried frame and stays
+     ~constant, hiding the correction. The real spin = ach - seed. Summing it gives
+     the actual accumulated heading, which is what the fix moves. */
+  int32_t seed = (bench_idx > 0 && Control_GetHeadingCarry()) ? bench_prev_resid : 0;
+  bench_phys_ddeg += (ach - seed);
+  bench_prev_resid = resid;
   cprintf("TURNDIAG,%d,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld\r\n",
           bench_idx, (long)cmd, (long)ach, (long)resid, (long)pk, (long)ms, (long)rs,
           (long)pl, (long)pr);
@@ -1605,12 +1618,18 @@ static void bench_task(void)
 
   if (--bench_remaining <= 0)
   {
-    cprintf("TURNSUM,%d,%ld,%ld\r\n> ", bench_idx, (long)bench_cum_ddeg,
-            (long)(bench_idx ? bench_cum_ddeg / bench_idx : 0));
+    /* cum_resid = sum of per-turn in-frame shortfalls (the raw under-rotate signal,
+       unchanged by hcarry). drift = true accumulated heading - ideal (idx*deg) = how
+       far the robot is ACTUALLY off after the whole sequence. hcarry drives drift ->
+       ~one turn's worth while cum_resid keeps reporting the per-turn shortfall. */
+    int32_t drift = bench_phys_ddeg - (int32_t)bench_idx * bench_deg * 10;
+    cprintf("TURNSUM,%d,%ld,%ld,%ld\r\n> ", bench_idx, (long)bench_cum_ddeg,
+            (long)(bench_idx ? bench_cum_ddeg / bench_idx : 0), (long)drift);
+    Control_RunEnd();                             /* close the run / hcarry window */
     bench_active = false;
     return;
   }
-  Control_StartPivot(bench_deg, bench_cps);       /* next turn                     */
+  Control_StartPivot(bench_deg, bench_cps);       /* next turn (seeded if hcarry)  */
 }
 
 static void cmd_benchturn(int argc, char **argv)
@@ -1629,8 +1648,11 @@ static void cmd_benchturn(int argc, char **argv)
 
   bench_deg = deg; bench_cps = rate; bench_remaining = n;
   bench_idx = 0; bench_cum_ddeg = 0;
+  bench_prev_resid = 0; bench_phys_ddeg = 0;
+  Control_RunBegin();                 /* one gyro cal + open the hcarry gate, as a real run */
   if (!Control_StartPivot(deg, rate))
   {
+    Control_RunEnd();                 /* battery gate: undo the run window we just opened */
     cprintf("BATTERY %s - benchturn disabled.\r\n", Battery_StateName(Battery_State()));
     return;
   }
@@ -2471,6 +2493,7 @@ static void dispatch(char *s)
   else if (ci_eq(cmd, "stop") || ci_eq(cmd, "s"))
   {
     stop_streams();
+    if (bench_active) Control_RunEnd();                    /* close benchturn run window */
     bench_active = false;                                  /* drop any benchturn */
     griptest_abort(NULL);                                  /* drop any grip test */
     spintest_abort(NULL);                                  /* drop any spin test */
@@ -2581,6 +2604,15 @@ static void dispatch(char *s)
     if (argc >= 2)
       Control_SetPivotSnappy(ci_eq(argv[1], "on") || ci_eq(argv[1], "1"));
     cprintf("snappy pivots %s\r\n", Control_GetPivotSnappy() ? "ON" : "off");
+  }
+  else if (ci_eq(cmd, "hcarry"))
+  {
+    /* toggle heading carry (the drift fix): carry a turn's under-rotate residual
+       into the next mid-run segment vs the old per-segment zero-reset. Lets a bench
+       run A/B the fix (hcarry off = reproduce the old ~8-11 deg cumulative drift). */
+    if (argc >= 2)
+      Control_SetHeadingCarry(ci_eq(argv[1], "on") || ci_eq(argv[1], "1"));
+    cprintf("heading carry %s\r\n", Control_GetHeadingCarry() ? "ON" : "off");
   }
   else if (ci_eq(cmd, "arcff"))
   {
