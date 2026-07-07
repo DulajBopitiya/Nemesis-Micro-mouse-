@@ -137,8 +137,18 @@ memory `ota-external-flash-plan.md`.
       waits). After fix: full apply verified (set BKP0R via `tools/set_apply.jlink`
       → app boots from the freshly-copied slot, PC free-running). App-side file
       dialog defaults to app_ota build (the only OTA-installable image).
-- [ ] B3 (robustness): golden image + boot-confirm + auto-rollback so a bad/
-      power-lost apply can't strand the app slot. (B2 is single-slot: SWD net.)
+- [x] **B3.1 — golden image + manual rollback (2026-07-07, bootloader paths
+      HW-verified):** `ota golden` promotes the staged (==running) image to the
+      QSPI golden slot (QSPI→QSPI copy, CRC-verified); `ota rollback` resets into
+      the bootloader which copies golden→app slot. Bootloader also auto-restores
+      golden if an apply copy fails midway. App: "Recovery ▾" menu (Save as
+      golden / Roll back). Verified via J-Link: normal boot ✓, apply-from-incoming
+      still ✓ (B2 regression), rollback with empty golden = safe no-op ✓ (never
+      strands). Full golden→rollback round-trip = user bench test.
+- [ ] B3.2 (automatic): bootloader stores current-app CRC meta; on every boot
+      CRC-gates the app slot and auto-restores golden if bad (closes the
+      power-loss-during-copy window). Plus boot-confirm trial counter for a
+      complete-but-crashing image. SWD net throughout.
 - [ ] (was) B2 bootloader (bottom of flash, never OTA'd): entry via RTC-backup
       flag + reset; receive image over PC4/PC5; CRC-verify in external flash; copy to
       internal app slot; jump. Keep a golden image in external flash for rollback

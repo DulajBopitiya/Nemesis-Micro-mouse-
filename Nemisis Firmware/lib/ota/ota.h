@@ -47,6 +47,11 @@
    the copy in bootloader/src/main.c. */
 #define OTA_APPLIED_MAGIC    0x0A9911EDu
 
+/* "Restore the golden image on next boot" - alternate value written to the same
+   apply flag (TAMP BKP0R). The bootloader copies the golden slot into the app
+   slot instead of the incoming slot. MUST match bootloader/src/main.c. */
+#define OTA_ROLLBACK_MAGIC   0x0B0B0B0Bu
+
 /* Metadata record stored (erased-then-written) in a dedicated QSPI sector. */
 typedef struct
 {
@@ -93,5 +98,20 @@ void Ota_RequestApply(void);
 /** Returns true exactly once after the bootloader installed an update this boot
  *  (reads and clears TAMP backup reg 1). Use it to show a boot confirmation. */
 bool Ota_JustApplied(void);
+
+/** Promote the staged incoming image to the golden (rollback) slot: copies the
+ *  incoming QSPI slot -> golden QSPI slot and writes golden metadata. Only
+ *  proceeds if the incoming image currently CRC-verifies (so golden is always a
+ *  known-good image). Intended right after a good `ota apply` (incoming == the
+ *  now-running firmware). Returns false if there's no valid incoming image or on
+ *  a flash error. */
+bool Ota_PromoteGolden(void);
+
+/** True iff a CRC-valid golden image is present (safe to roll back to). */
+bool Ota_GoldenValid(void);
+
+/** Request a rollback to the golden image on next boot (sets the apply flag to
+ *  OTA_ROLLBACK_MAGIC). Caller then resets. Only call if Ota_GoldenValid(). */
+void Ota_RequestRollback(void);
 
 #endif /* OTA_H */

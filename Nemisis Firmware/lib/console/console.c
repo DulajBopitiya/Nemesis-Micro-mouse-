@@ -2415,9 +2415,28 @@ static void cmd_ota(int argc, char **argv)
     HAL_Delay(150);                 /* let the message flush over UART/RTT */
     NVIC_SystemReset();             /* does not return */
   }
+  else if (ci_eq(sub, "golden"))
+  {
+    /* Save the staged (== currently running, right after an apply) image as the
+       known-good rollback target. QSPI->QSPI copy; stalls the loop ~1-2 s. */
+    puts_("ota golden: promoting staged image to golden (rollback) slot...\r\n");
+    cprintf("ota golden: %s\r\n", Ota_PromoteGolden() ? "saved OK" : "FAILED (no valid staged image?)");
+  }
+  else if (ci_eq(sub, "rollback"))
+  {
+    if (!Ota_GoldenValid())
+    {
+      puts_("ota rollback: no valid golden image - refusing\r\n");
+      return;
+    }
+    puts_("ota rollback: restoring golden image, resetting into bootloader...\r\n");
+    Ota_RequestRollback();
+    HAL_Delay(150);
+    NVIC_SystemReset();
+  }
   else
   {
-    puts_("usage: ota [info|verify|apply]\r\n");
+    puts_("usage: ota [info|verify|apply|golden|rollback]\r\n");
   }
 }
 

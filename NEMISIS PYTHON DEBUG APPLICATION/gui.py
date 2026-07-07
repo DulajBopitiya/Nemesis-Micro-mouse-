@@ -855,6 +855,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "Stage an existing firmware .bin into the mouse's QSPI flash over WiFi"
         )
         self.ota_btn.clicked.connect(self._ota_clicked)
+        # Recovery menu: save the running firmware as the golden fallback, or
+        # roll back to it (see `ota golden` / `ota rollback` in the firmware).
+        self.recovery_btn = QtWidgets.QToolButton()
+        self.recovery_btn.setText("Recovery ▾")
+        self.recovery_btn.setToolTip("Golden-image backup and rollback")
+        self.recovery_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        _rmenu = QtWidgets.QMenu(self.recovery_btn)
+        _rmenu.addAction("Save running firmware as golden", self._golden_clicked)
+        _rmenu.addAction("Roll back to golden…", self._rollback_clicked)
+        self.recovery_btn.setMenu(_rmenu)
         self.status_lbl = QtWidgets.QLabel("● disconnected")
         # persistent battery status indicator (voltage / SoC / safety state)
         self.batt_lbl = QtWidgets.QLabel("🔋 —")
@@ -867,6 +877,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.wifi_setup_btn)
         bar.addWidget(self.build_push_btn)
         bar.addWidget(self.ota_btn)
+        bar.addWidget(self.recovery_btn)
         bar.addStretch(1)
         bar.addWidget(self.batt_lbl)
         bar.addSpacing(16)
@@ -1936,6 +1947,40 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         self._ota_stage_path(path)
+
+    def _golden_clicked(self):
+        """Save the currently-running (last-staged) firmware as the golden
+        rollback image. Best done right after a good update, when the staged
+        image == what's running. Sends `ota golden`."""
+        if not (self.bridge and self.bridge.link.connected):
+            self._log("[not connected]")
+            return
+        ok = QtWidgets.QMessageBox.question(
+            self, "Save as golden",
+            "Save the last-staged firmware as the golden rollback image?\n\n"
+            "Do this right after a successful update, so 'Roll back' returns to "
+            "this known-good build. Takes a second or two on the mouse.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes)
+        if ok == QtWidgets.QMessageBox.Yes:
+            self._send("ota golden")
+
+    def _rollback_clicked(self):
+        """Restore the golden image. Sends `ota rollback` (mouse resets into the
+        bootloader, copies golden -> app slot, reboots)."""
+        if not (self.bridge and self.bridge.link.connected):
+            self._log("[not connected]")
+            return
+        ok = QtWidgets.QMessageBox.warning(
+            self, "Roll back firmware",
+            "Restore the golden (known-good) firmware?\n\n"
+            "The mouse resets into the bootloader, copies the golden image into "
+            "place, and reboots. The link drops briefly and reconnects.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if ok == QtWidgets.QMessageBox.Yes:
+            self._log("[ota] rolling back to golden — mouse resetting…")
+            self._send("ota rollback")
 
     def _ota_stage_path(self, path: str):
         """Stage the given .bin into QSPI over WiFi, then offer to install it.

@@ -129,6 +129,65 @@ bool Ota_FinishStage(uint32_t expected_crc, uint32_t *out_crc, uint32_t *out_rec
   return crc_ok;
 }
 
+bool Ota_GoldenValid(void)
+{
+  OtaMeta m;
+  if (!QSpiFlash_Read(OTA_META_GOLDEN, (uint8_t *)&m, sizeof m)) return false;
+  if (m.magic != OTA_META_MAGIC || m.status != OTA_STATUS_VALID) return false;
+  if (m.size == 0 || m.size > OTA_IMAGE_MAX) return false;
+
+  uint32_t crc;
+  if (!crc_slot(OTA_SLOT_GOLDEN, m.size, &crc)) return false;
+  return crc == m.crc32;
+}
+
+bool Ota_PromoteGolden(void)
+{
+  /* Only snapshot a known-good image. Incoming must verify right now. */
+  OtaMeta in;
+  if (!Ota_ReadMeta(&in)) return false;
+  if (in.magic != OTA_META_MAGIC || in.status != OTA_STATUS_VALID) return false;
+  if (in.size == 0 || in.size > OTA_IMAGE_MAX) return false;
+  if (!Ota_VerifyIncoming()) return false;
+
+  /* Invalidate golden metadata first: an interrupted copy must not look valid. */
+  OtaMeta bad = { 0, 0, 0, OTA_STATUS_INVALID };
+  if (!write_meta(OTA_META_GOLDEN, &bad)) return false;
+
+  /* Erase the golden sectors the image will occupy. */
+  uint32_t end = OTA_SLOT_GOLDEN + in.size;
+  for (uint32_t a = OTA_SLOT_GOLDEN & ~(QSPIFLASH_SECTOR_SIZE - 1u);
+       a < end; a += QSPIFLASH_SECTOR_SIZE)
+    if (!QSpiFlash_EraseSector(a)) return false;
+
+  /* Copy incoming -> golden in QSPI, block by block. */
+  uint8_t buf[256];
+  uint32_t off = 0;
+  while (off < in.size)
+  {
+    uint32_t n = in.size - off;
+    if (n > sizeof buf) n = sizeof buf;
+    if (!QSpiFlash_Read(OTA_SLOT_INCOMING + off, buf, n)) return false;
+    if (!QSpiFlash_Write(OTA_SLOT_GOLDEN + off, buf, n))  return false;
+    off += n;
+  }
+
+  /* Verify the golden copy, then mark it valid. */
+  uint32_t gcrc;
+  if (!crc_slot(OTA_SLOT_GOLDEN, in.size, &gcrc) || gcrc != in.crc32) return false;
+
+  OtaMeta g = { OTA_META_MAGIC, in.size, in.crc32, OTA_STATUS_VALID };
+  return write_meta(OTA_META_GOLDEN, &g);
+}
+
+void Ota_RequestRollback(void)
+{
+  __HAL_RCC_PWR_CLK_ENABLE();
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_RTCAPB_CLK_ENABLE();
+  TAMP->BKP0R = OTA_ROLLBACK_MAGIC;
+}
+
 void Ota_RequestApply(void)
 {
   /* Unlock backup-domain write access and clock the RTC/TAMP register

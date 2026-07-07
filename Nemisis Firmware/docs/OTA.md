@@ -36,10 +36,22 @@ cd bootloader && pio run && cd ..
    - New firmware flashes the LEDs **green** on first boot ("installed and running").
    - The WiFi link drops during the reset/copy (~few seconds); reconnect.
 
+## Golden image / rollback
+Keep a known-good "golden" firmware in QSPI to fall back to.
+- **Save as golden** (app: Recovery ▾ → Save…, or `ota golden`): copies the
+  last-staged image (== what's running, right after a good update) into the
+  golden QSPI slot. Do this once you're happy a build is solid.
+- **Roll back** (app: Recovery ▾ → Roll back…, or `ota rollback`): resets into
+  the bootloader, which copies the golden image into the app slot and reboots.
+- The bootloader also auto-restores golden if an `ota apply` copy fails midway
+  (best-effort rescue). A full power loss *during* the copy is the remaining gap
+  the automatic boot-time CRC gate (planned) will close.
+
 ## Console commands
 - `qspi id | status | read <addr> [n] | test` - external flash driver/diagnostics
 - `otarx <size> <crc32>` - firmware receive (the app drives this; base64 payload)
-- `ota info | verify | apply` - inspect / re-CRC / install the staged image
+- `ota info | verify | apply | golden | rollback` - inspect / re-CRC / install /
+  save-golden / restore-golden
 
 ## Safety net
 - SWD/J-Link always recovers: flashing a normal `nucleo_g474re` build overwrites
