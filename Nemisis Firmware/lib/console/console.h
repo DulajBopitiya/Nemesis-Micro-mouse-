@@ -46,6 +46,7 @@ typedef struct
   TIM_HandleTypeDef  *htim_encL;   /* left  ABI quadrature   (htim1) */
   TIM_HandleTypeDef  *htim_encR;   /* right ABI quadrature   (htim2) */
   UART_HandleTypeDef *huart;       /* link to ESP32-C3       (huart1) */
+  QSPI_HandleTypeDef *hqspi;       /* W25Q32JW OTA staging   (hqspi1) */
 } ConsoleCtx;
 
 /** Bind handles, init the subsystems the console drives (encoders, motor

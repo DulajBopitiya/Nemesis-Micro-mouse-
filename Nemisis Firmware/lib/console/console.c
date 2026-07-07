@@ -18,6 +18,7 @@
 #include "sensors.h"
 #include "solver.h"
 #include "mazestore.h"
+#include "qspiflash.h"
 
 #include <string.h>
 #include <stdarg.h>
@@ -29,6 +30,7 @@
 static const ConsoleCtx *C;          /* bound handles */
 
 static AS5047P_Handle encL, encR;    /* the two magnetic encoders on SPI3 */
+static bool qspi_ok;                 /* W25Q32JW probed OK at boot (OTA flash) */
 
 /* Live-stream selector. Action commands (motor/vacuum/buzzer) are one-shot
    and leave the mode at IDLE. */
@@ -2147,6 +2149,76 @@ static void cmd_tlm(int argc, char **argv)
   cprintf("telemetry %s for %s loop\r\n", on ? "ON" : "off", argv[1]);
 }
 
+/* W25Q32JW OTA-staging flash on QUADSPI1. Bring-up + diagnostics:
+     qspi [id]            read + interpret the JEDEC id (bus-alive proof)
+     qspi status          dump Status Register 1 (WIP/WEL)
+     qspi read <addr> [n] hex-dump n bytes from hex addr (n<=256, default 64)
+     qspi test            DESTRUCTIVE erase/program/verify round-trip on the
+                          last 4 KB sector (scratch, never an OTA slot) */
+static void cmd_qspi(int argc, char **argv)
+{
+  const char *sub = (argc >= 2) ? argv[1] : "id";
+
+  if (ci_eq(sub, "id"))
+  {
+    QSpiFlash_ID id;
+    if (!QSpiFlash_ReadID(&id)) { puts_("qspi: ID read FAILED (bus error)\r\n"); return; }
+    cprintf("QSPI id: mfr=0x%02X type=0x%02X cap=0x%02X",
+            id.mfr, id.mem_type, id.capacity);
+    if (id.mfr == QSPIFLASH_MFR_WINBOND && id.capacity == QSPIFLASH_CAP_32MBIT)
+      puts_("  -> Winbond W25Q32 (4 MB) OK\r\n");
+    else
+      puts_("  -> UNRECOGNISED (expected EF/60/16)\r\n");
+  }
+  else if (ci_eq(sub, "status"))
+  {
+    uint8_t sr1;
+    if (!QSpiFlash_ReadStatus(&sr1)) { puts_("qspi: status read FAILED\r\n"); return; }
+    cprintf("QSPI SR1=0x%02X (WIP=%d WEL=%d)\r\n",
+            sr1, (int)(sr1 & 1u), (int)((sr1 >> 1) & 1u));
+  }
+  else if (ci_eq(sub, "read"))
+  {
+    if (argc < 3) { puts_("usage: qspi read <hexaddr> [n]\r\n"); return; }
+    uint32_t addr = (uint32_t)strtoul(argv[2], NULL, 16);
+    uint32_t n    = (argc >= 4) ? (uint32_t)strtoul(argv[3], NULL, 0) : 64u;
+    if (n > 256u) n = 256u;
+    uint8_t buf[256];
+    if (!QSpiFlash_Read(addr, buf, n)) { puts_("qspi: read FAILED (range?)\r\n"); return; }
+    for (uint32_t i = 0; i < n; i += 16u)
+    {
+      cprintf("%06lX:", (unsigned long)(addr + i));
+      for (uint32_t j = 0; j < 16u && (i + j) < n; j++) cprintf(" %02X", buf[i + j]);
+      puts_("\r\n");
+    }
+  }
+  else if (ci_eq(sub, "test"))
+  {
+    /* Round-trip on the LAST sector - scratch space, never an OTA image slot. */
+    const uint32_t addr = QSPIFLASH_CHIP_SIZE - QSPIFLASH_SECTOR_SIZE;
+    uint8_t buf[64], pat[64];
+
+    cprintf("QSPI self-test @0x%06lX (erase+program+verify)...\r\n",
+            (unsigned long)addr);
+    if (!QSpiFlash_EraseSector(addr)) { puts_("  erase FAILED\r\n"); return; }
+    if (!QSpiFlash_Read(addr, buf, sizeof buf)) { puts_("  read-after-erase FAILED\r\n"); return; }
+    for (int i = 0; i < 64; i++)
+      if (buf[i] != 0xFF) { cprintf("  erase-verify FAILED @%d=0x%02X\r\n", i, buf[i]); return; }
+
+    for (int i = 0; i < 64; i++) pat[i] = (uint8_t)(i * 7 + 3);
+    if (!QSpiFlash_Write(addr, pat, sizeof pat)) { puts_("  program FAILED\r\n"); return; }
+    if (!QSpiFlash_Read(addr, buf, sizeof buf)) { puts_("  read-back FAILED\r\n"); return; }
+    for (int i = 0; i < 64; i++)
+      if (buf[i] != pat[i]) { cprintf("  verify FAILED @%d got=0x%02X want=0x%02X\r\n", i, buf[i], pat[i]); return; }
+
+    puts_("  PASS - erase/program/read round-trip OK\r\n");
+  }
+  else
+  {
+    puts_("usage: qspi [id|status|read <addr> [n]|test]\r\n");
+  }
+}
+
 /* ====================== dispatcher ====================================== */
 
 static void dispatch(char *s)
@@ -2340,6 +2412,10 @@ static void dispatch(char *s)
   {
     cmd_mem(argc, argv);
   }
+  else if (ci_eq(cmd, "qspi"))
+  {
+    cmd_qspi(argc, argv);
+  }
   else if (ci_eq(cmd, "sim"))
   {
     cmd_sim(argc, argv);
@@ -2504,6 +2580,12 @@ void Console_Init(const ConsoleCtx *ctx)
   /* Vacuum PWM ready at 0 %. */
   HAL_TIM_PWM_Start(C->htim_fan, TIM_CHANNEL_3);
   __HAL_TIM_SET_COMPARE(C->htim_fan, TIM_CHANNEL_3, 0);
+
+  /* Probe the W25Q32JW OTA-staging flash on QUADSPI1 (binds the driver handle).
+     Non-fatal: a missing/failed chip just means OTA staging is unavailable. */
+  qspi_ok = QSpiFlash_Init(C->hqspi);
+  cprintf("QSPI flash (OTA staging): %s\r\n",
+          qspi_ok ? "W25Q32JW OK" : "NOT DETECTED (run 'qspi id')");
 
   print_menu();
 }

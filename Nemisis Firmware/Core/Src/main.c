@@ -368,6 +368,7 @@ int main(void)
     .htim_encL = &htim1,
     .htim_encR = &htim2,
     .huart     = &huart1,
+    .hqspi     = &hqspi1,
   };
   Console_Init(&con);
 
