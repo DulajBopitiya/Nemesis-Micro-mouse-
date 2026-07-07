@@ -96,9 +96,14 @@ reverted-then-re-added bits). Safety net = `sim` + build.
 Goal: flash the STM32 over the existing WiFi link instead of SWD. **Stage the image
 in the board's EXTERNAL flash** (not yet configured). Full design + rationale in
 memory `ota-external-flash-plan.md`.
-- [ ] Fix the latent linker risk first: cap `STM32G474RETX_FLASH.ld` app region so it
-      can't grow into the top 3 persistent pages (maze/cal/settings @ 0x0807D000+)
-- [ ] `git init` the firmware repo (no safety net today) BEFORE any .ioc regen
+- [x] Fix the latent linker risk first: cap the app region so it can't grow into the
+      top 3 persistent pages (maze/cal/settings @ 0x0807D000+) *(2026-07-07: KEY FINDING
+      — PlatformIO ignores `STM32CubeIDE/*.ld`; it uses the package script from
+      `tool-ldscripts-ststm32/stm32g4/STM32G474RETX_FLASH.ld`. Fix: copied that script
+      into repo `linker/STM32G474RETX_FLASH.ld`, capped FLASH 512K→500K, pointed
+      `board_build.ldscript` at it in platformio.ini. Build-verified: links clean
+      (Flash 21.7%), verbose link shows `-T linker/STM32G474RETX_FLASH.ld`.)*
+- [x] `git init` the firmware repo — already under git (branch `main`)
 - [ ] Configure external flash in `NEMSIS.ioc` (SPI/QSPI) — **⚠️ regen wipes main.c
       SPI1/SPI3/HSE fixes: back up Core/ + re-apply per the checklist in the memory**
 - [ ] Minimal STM32 bootloader (bottom of flash, never OTA'd): entry via RTC-backup
